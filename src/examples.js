@@ -7,24 +7,24 @@ import { runCode } from './display.js';
 export const EXAMPLES = {
   "Dice Basics": {
     "Simple dice": `// Basic dice pools
-display(d6,                        "d6")
-display(d6.addDice(1),             "2d6")
-display(d6.addDice(3).keepHigh(3), "4d6 keep 3")
-display(d6.addDice(3).keepLow(1),  "4d6 keep lowest")
-display(d8.addBonus(3),            "d8 + 3")
+display(d6,                   "d6")
+display(d6(2),                "2d6")
+display(d6(4).keepHigh(3),    "4d6 keep 3")
+display(d6(4).keepLow(1),     "4d6 keep lowest")
+display(d8.addBonus(3),       "d8 + 3")
 display(customDie([1,3,5,7,9]),    "odd d5")
-display(customDie([2,2,3,3,4,6]),  "non-standard d6")`,
+display(customDie([2,2,3,3,4,6]), "non-standard d6")`,
 
     "Advantage / disadvantage": `// Advantage and disadvantage
-display(d20.addDice(1).keepHigh(1), "d20 advantage",    dice => ev(dice) >= 10)
-display(d20,                        "d20 normal",       dice => ev(dice) >= 10)
-display(d20.addDice(1).keepLow(1),  "d20 disadvantage", dice => ev(dice) >= 10)
+display(d20(2).keepHigh(1), "d20 advantage",    dice => ev(dice) >= 10)
+display(d20,                "d20 normal",       dice => ev(dice) >= 10)
+display(d20(2).keepLow(1),  "d20 disadvantage", dice => ev(dice) >= 10)
 
 // Scaling: effect of advantage
 displayScaling(
   n => n >= 0
-    ? d20.addDice(n).keepHigh(1)
-    : d20.addDice(-n).keepLow(1),
+    ? d20(n + 1).keepHigh(1)
+    : d20(-n + 1).keepLow(1),
   {from: -3, to: 3},
   "advantage scaling (-=disadv, +=adv)",
   dice => ev(dice) >= 10,
@@ -32,10 +32,10 @@ displayScaling(
 )`,
 
     "Pools & keep": `// Keep highest / lowest
-display(d6.addDice(2).keepHigh(1),  "3d6 keep 1 (best)")
-display(d6.addDice(2).keepHigh(2),  "3d6 keep 2")
-display(d6.addDice(2),              "3d6 keep all")
-display(d6.addDice(5).keepHigh(3),  "6d6 keep 3")`,
+display(d6(3).keepHigh(1), "3d6 keep 1 (best)")
+display(d6(3).keepHigh(2), "3d6 keep 2")
+display(d6(3),             "3d6 keep all")
+display(d6(6).keepHigh(3), "6d6 keep 3")`,
   },
 
   "Attack Mechanics": {
@@ -82,9 +82,9 @@ const degrees = [
 
 displayScaling(
   [
-    nimbleAttack(die(2).addDice(5)),
-    nimbleAttack(die(4).addDice(2)),
-    nimbleAttack(die(6).addDice(1)),
+    nimbleAttack(die(2)(6)),
+    nimbleAttack(die(4)(3)),
+    nimbleAttack(die(6)(2)),
     nimbleAttack(die(8)),
     nimbleAttack(die(10)),
   ],
@@ -125,7 +125,7 @@ displayScaling(
   "Pass / Fail": {
     "Threshold checks": `// Roll vs target number — how does pool size help?
 displayScaling(
-  n => d6.addDice(n - 1),
+  n => d6(n),
   {from: 1, to: 6},
   "Nd6 pool vs target 10",
   dice => ev(dice) >= 10,
@@ -133,7 +133,7 @@ displayScaling(
 )
 
 displayScaling(
-  n => d6.addDice(n - 1).keepHigh(1),
+  n => d6(n).keepHigh(1),
   {from: 1, to: 6},
   "Nd6 keep best vs target 4",
   dice => ev(dice) >= 4,
@@ -142,7 +142,7 @@ displayScaling(
 
     "Danger dice": `// Environmental danger pool — how many 1s appear?
 displayScaling(
-  n => d6.addDice(n - 1),
+  n => d6(n),
   {from: 1, to: 8},
   "danger pool — ones rolled",
   [
@@ -156,7 +156,7 @@ displayScaling(
 
     "Opposed rolls": `// Attacker vs defender — P(attacker wins)
 displayScaling(
-  n => d6.addDice(n - 1),
+  n => d6(n),
   {from: 1, to: 5},
   "attacker pool size (vs 2d6 defender)",
   dice => ev(dice) > 7,
@@ -186,8 +186,8 @@ display(customDie([1,1,1,1,2,3]),       "weak d6 (mostly 1s)")
 
 displayScaling(
   [
-    customDie([1,2,3,3,4,5]).addDice(1),
-    d6.addDice(1),
+    customDie([1,2,3,3,4,5]).addDice(1), // customDie isn't callable, addDice still works
+    d6(2),
     customDie([0,0,0,2,4,6]).addDice(1),
   ],
   {labels: ["skewed 2d6","normal 2d6","swingy 2d6"]},
@@ -200,14 +200,14 @@ displayScaling(
   "Cumulative": {
     "Roll until success": `// How many attempts to hit a target sum?
 displayCumulative(
-  die(6).addDice(2),
+  d6(3),
   "3d6 — P(sum ≥ 7) over N attempts",
   dice => ev(dice) >= 7,
   {attempts: 8}
 )
 
 displayCumulative(
-  die(6).addDice(2),
+  d6(3),
   "3d6 — P(sum ≥ 12) over N attempts",
   dice => ev(dice) >= 12,
   {attempts: 12}
@@ -215,7 +215,7 @@ displayCumulative(
 
     "Danger accumulation": `// How likely to see at least one 1 (or more) in N danger rolls?
 displayCumulative(
-  die(6).addDice(2),
+  d6(3),
   "3d6 danger — bad things over time",
   [
     {label: "at least one 1",   color: "#ef4444", fn: dice => dice.filter(d=>d===1).length >= 1},
@@ -234,7 +234,7 @@ displayCumulative(
 )
 
 displayCumulative(
-  d6.addDice(1),
+  d6(2),
   "2d6 encounter — P(snake eyes in N days)",
   dice => ev(dice) === 2,
   {attempts: 20}

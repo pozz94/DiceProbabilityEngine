@@ -742,8 +742,23 @@ function fixPointWithGroups(raw, type) {
 // ----------------------------------------------------------------
 // Public API
 // ----------------------------------------------------------------
+// Wrap a Pool so it can also be called as a function:
+//   d6(3)  →  3 dice of the same type  (i.e. d6.addDice(2))
+// The Proxy target must itself be a function for the apply trap to fire.
+function callablePool(p) {
+  const fn = function(n = 1) {
+    return n === 1 ? p : p.addDice(n - 1);
+  };
+  return new Proxy(fn, {
+    apply(_target, _thisArg, args) { return fn(...args); },
+    get(_target, prop, _receiver)  { return Reflect.get(p, prop, p); },
+    has(_target, prop)             { return prop in p; },
+    getPrototypeOf()               { return Object.getPrototypeOf(p); },
+  });
+}
+
 export function die(sides, name) {
-  return new Pool(new DieType(sides, name), 1);
+  return callablePool(new Pool(new DieType(sides, name), 1));
 }
 
 export function pool(x, n) {

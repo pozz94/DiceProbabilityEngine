@@ -1,5 +1,6 @@
 import { EXAMPLES, toggleExampleMenu, closeExampleMenu } from './examples.js';
 import { runCode } from './display.js';
+import { registerHints } from './hints.js';
 
 // ================================================================
 // Monaco editor initialisation — single entry point for the app
@@ -59,6 +60,8 @@ window.MonacoEnvironment = {
 require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
 
 require(['vs/editor/editor.main'], () => {
+  registerHints();
+
   monaco.editor.defineTheme('diceTheme', {
     base: 'vs-dark',
     inherit: true,
