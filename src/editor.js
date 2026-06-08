@@ -23,8 +23,6 @@ window.addEventListener('error', e => {
   }
 }, true);
 
-// getEditorValue is the single dependency injection point so display.js
-// never needs to know about window._editor directly.
 function getEditorValue() {
   return window._editor ? window._editor.getValue() : '';
 }
@@ -33,11 +31,9 @@ function doRun() {
   runCode(getEditorValue);
 }
 
-// Wire the global onclick handlers used in the HTML markup
 window._toggleExampleMenu = () => toggleExampleMenu(getEditorValue);
 window._runCode = doRun;
 
-// Keyboard shortcut fallback for when Monaco hasn't loaded yet
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !window._editor) {
     e.preventDefault();
@@ -45,21 +41,47 @@ document.addEventListener('keydown', e => {
   }
 });
 
-// Monaco requires its loader to be on the page already (loaded via <script> in HTML)
-window.MonacoEnvironment = {
-  getWorker() {
-    return {
-      postMessage() {},
-      addEventListener() {},
-      removeEventListener() {},
-      terminate() {},
-    };
-  }
-};
-
 require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
 
 require(['vs/editor/editor.main'], () => {
+  // Register 'dicescript' as a language that uses JavaScript tokenization
+  // but has NO built-in worker or intellisense. This prevents Monaco's JS
+  // language service from registering its own completion provider (which hangs
+  // with a no-op worker and shows "Loading..." forever).
+  monaco.languages.register({ id: 'dicescript' });
+  monaco.languages.setLanguageConfiguration('dicescript', {
+    comments: { lineComment: '//', blockComment: ['/*', '*/'] },
+    brackets: [['(', ')'], ['[', ']'], ['{', '}']],
+    autoClosingPairs: [
+      { open: '(', close: ')' },
+      { open: '[', close: ']' },
+      { open: '{', close: '}' },
+      { open: "'", close: "'", notIn: ['string', 'comment'] },
+      { open: '"', close: '"', notIn: ['string'] },
+      { open: '`', close: '`', notIn: ['string'] },
+    ],
+    surroundingPairs: [
+      { open: '(', close: ')' },
+      { open: '[', close: ']' },
+      { open: '{', close: '}' },
+      { open: "'", close: "'" },
+      { open: '"', close: '"' },
+      { open: '`', close: '`' },
+    ],
+    indentationRules: {
+      increaseIndentPattern: /^.*\{[^}"'`]*$/,
+      decreaseIndentPattern: /^\s*\}/,
+    },
+  });
+
+  // Reuse Monaco's built-in JavaScript monarch tokenizer for syntax highlighting.
+  const jsLang = monaco.languages.getLanguages().find(l => l.id === 'javascript');
+  if (jsLang && jsLang.loader) {
+    jsLang.loader().then(({ language }) => {
+      monaco.languages.setMonarchTokensProvider('dicescript', language);
+    });
+  }
+
   registerHints();
 
   monaco.editor.defineTheme('diceTheme', {
@@ -90,7 +112,7 @@ require(['vs/editor/editor.main'], () => {
 
   window._editor = monaco.editor.create(document.getElementById('monaco-container'), {
     value: EXAMPLES['Dice Basics']['Simple dice'],
-    language: 'javascript',
+    language: 'dicescript',
     theme: 'diceTheme',
     fontSize: 13,
     lineHeight: 22,
@@ -111,6 +133,11 @@ require(['vs/editor/editor.main'], () => {
     wordWrap: 'off',
     automaticLayout: true,
     scrollbar: { verticalScrollbarSize: 6, horizontalScrollbarSize: 6 },
+    quickSuggestions: true,
+    suggestOnTriggerCharacters: true,
+    acceptSuggestionOnEnter: 'on',
+    tabCompletion: 'on',
+    suggest: { snippetsPreventQuickSuggestions: false },
   });
 
   window._editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
