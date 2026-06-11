@@ -1,6 +1,7 @@
 // ================================================================
 // Monaco intellisense for the DiceScript runtime sandbox.
 // ================================================================
+import * as monaco from 'monaco-editor';
 
 // Full .d.ts for the sandbox globals. Monaco's JS language service
 // reads this via addExtraLib and produces autocomplete + hover

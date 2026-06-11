@@ -9,7 +9,8 @@
       "Bash(npm install *)",
       "Bash(Test-Path \"c:\\\\Users\\\\davide.pozzani\\\\Documents\\\\Progetti\\\\NODE\\\\DiceProbabilityEngine\\\\node_modules\\\\vite\")",
       "Bash(npm run *)",
-      "Bash(npm uninstall *)"
+      "Bash(npm uninstall *)",
+      "Bash(npx vite *)"
     ]
   }
 }
