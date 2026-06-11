@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dice Probability Engine</title>
+  <script type="module" crossorigin src="/DiceProbabilityEngine/assets/index-HkY1OX-b.js"></script>
+  <link rel="stylesheet" crossorigin href="/DiceProbabilityEngine/assets/index-DyrF4ykb.css">
+</head>
+<body>
+
+<div id="topbar">
+  <div class="title">⚄ Dice Engine</div>
+  <div class="tag">DiceScript v2</div>
+  <div class="spacer"></div>
+  <div class="shortcut">Ctrl+Enter</div>
+  <button class="example" id="examples-btn" onclick="window._toggleExampleMenu()">EXAMPLES ▾</button>
+  <button class="run" onclick="window._runCode()">▶ RUN</button>
+</div>
+
+<div id="example-accordion">
+  <div id="example-accordion-inner"></div>
+</div>
+
+<div id="main">
+  <div id="editor-pane">
+    <div id="monaco-container"></div>
+  </div>
+  <div id="output-pane">
+    <div class="pane-header">OUTPUT</div>
+    <div id="output-scroll">
+      <div class="empty-state">
+        <div class="big">⚄</div>
+        <div>Write expressions · press Run</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
