@@ -6,12 +6,16 @@
 //
 // Pool is a lazy builder. pool._resolve(cutoff) returns WeightedOutcomes.
 //
-// .then(fn) iterates over each concrete outcome, calls fn(Kept),
-// collects the result, and merges everything back into WeightedOutcomes.
+// pool[n]            → DieRef(n): a lazy reference to die n of this pool.
+// dieRef.isMax/isMin → DieCondition: a lazy condition for use in .when().
+// pool.when(cond, result)
+//   → ConditionalPool: for each concrete outcome, if cond fires resolve to
+//     result; otherwise pass the outcome through unchanged. Chain freely.
+// pool.discard()     → LazyDiscard sentinel: when used as a .when() result,
+//     marks the current outcome's dice as discarded.
 //
-// Inside .then(kept => ...):
-//   kept.leftmost / .rightmost → BranchValue (concrete scalar + context)
-//   bv.when(v, fn).otherwise(fn) → returns resolved WeightedOutcomes or Kept
+// .morph(fn) is the lower-level escape hatch: iterates every concrete
+// outcome, calls fn(Kept), merges results back into WeightedOutcomes.
 //
 // resolveToOutcomes(x) is the single conversion function that turns
 // whatever the user returned (Kept, Pool, EmptyPool, number, null)
@@ -226,7 +230,7 @@ function resolveAddIntent(intent, type, cutoff) {
 }
 
 // ----------------------------------------------------------------
-// Kept: what fn receives inside .then(kept => ...)
+// Kept: what fn receives inside .morph(kept => ...)
 // ----------------------------------------------------------------
 function makeKept(dice, type, cutoff) {
   const types = Array.isArray(type) ? type : dice.map(() => type);
@@ -291,6 +295,29 @@ function makeKept(dice, type, cutoff) {
   kept.addBonus = (n, poolName) => n ? kept.addDice(customDie([n], `+${n}`), poolName || `+${n}`) : kept;
   return kept;
 }
+
+// ----------------------------------------------------------------
+// DieRef / DieCondition — pool[n].isMax / pool[n].isMin
+// ----------------------------------------------------------------
+export class DieRef {
+  constructor(index) { this._index = index; }
+  get isMax() { return new DieCondition(this._index, 'max'); }
+  get isMin() { return new DieCondition(this._index, 'min'); }
+}
+
+export class DieCondition {
+  constructor(index, type) { this._index = index; this._type = type; }
+  test(dice, types) {
+    const i = this._index < 0 ? dice.length + this._index : this._index;
+    if (i < 0 || i >= dice.length) return false;
+    const t = Array.isArray(types) ? types[i] : types;
+    if (!t) return false;
+    return this._type === 'max' ? dice[i] === t.max : dice[i] === t.min;
+  }
+}
+
+// Sentinel returned by pool.discard() — ConditionalPool handles it specially.
+class LazyDiscard {}
 
 // ----------------------------------------------------------------
 // TaggedProb
@@ -400,7 +427,15 @@ export class Pool {
     return s;
   }
 
-  addDice(poolOrN, poolName) {
+  addDice(poolOrN, poolOrName, maybeName) {
+    // Conditional overload: addDice(DieCondition, pool, name?)
+    // Adds pool to the current concrete outcome only when condition fires.
+    if (poolOrN instanceof DieCondition) {
+      const aw = new AddWhenPool(this, poolOrN, coercePool(poolOrName));
+      if (maybeName) aw.poolName = maybeName;
+      return aw;
+    }
+    const poolName = poolOrName;
     if (Array.isArray(poolOrN)) return this.addDice(coercePool(poolOrN), poolName);
     if (typeof poolOrN === 'function') { const c = new ConcatPool(this, new LazyPool(poolOrN, this.type)); c.poolName = poolName||null; return c; }
     if (poolOrN instanceof EmptyPool) return this;
@@ -419,17 +454,19 @@ export class Pool {
   }
 
   keepHigh(n, dir = 1) {
-    const p = Object.create(Object.getPrototypeOf(this));
-    Object.assign(p, this);
-    p._ops = [...(this._ops||[]), {op: 'keepHigh', args: [n, dir]}];
+    const self = this[UNWRAP] ?? this;
+    const p = Object.create(Object.getPrototypeOf(self));
+    Object.assign(p, self);
+    p._ops = [...(self._ops||[]), {op: 'keepHigh', args: [n, dir]}];
     p._keepN = n;
     return p;
   }
 
   keepLow(n, dir = 1) {
-    const p = Object.create(Object.getPrototypeOf(this));
-    Object.assign(p, this);
-    p._ops = [...(this._ops||[]), {op: 'keepLow', args: [n, dir]}];
+    const self = this[UNWRAP] ?? this;
+    const p = Object.create(Object.getPrototypeOf(self));
+    Object.assign(p, self);
+    p._ops = [...(self._ops||[]), {op: 'keepLow', args: [n, dir]}];
     p._keepN = n;
     return p;
   }
@@ -439,7 +476,16 @@ export class Pool {
     return this.addDice(customDie([n], `+${n}`), poolName || `+${n}`);
   }
 
-  then(fn) {
+  when(condition, result) {
+    if (result === undefined) return new ConditionalBuilder(this, condition);
+    return new ConditionalPool(this, condition, result);
+  }
+
+  discard() {
+    return new LazyDiscard();
+  }
+
+  morph(fn) {
     return new ThenPool(this, fn);
   }
 
@@ -491,6 +537,16 @@ export class Pool {
   toPMF(cutoff = EPSILON) { return toPMF(this._resolve(cutoff)); }
 }
 
+// pool[0]..pool[15] and pool[-1] return DieRef(n) for use in .when() conditions.
+for (let i = 0; i < 16; i++) {
+  Object.defineProperty(Pool.prototype, String(i), {
+    get() { return new DieRef(i); }, configurable: true, enumerable: false,
+  });
+}
+Object.defineProperty(Pool.prototype, '-1', {
+  get() { return new DieRef(-1); }, configurable: true, enumerable: false,
+});
+
 // ----------------------------------------------------------------
 // Global mode + sampling
 // ----------------------------------------------------------------
@@ -519,10 +575,12 @@ function sampleDie(type) {
 }
 
 function poolStructureKey(pool) {
-  if (pool instanceof ThenPool) return `then(${poolStructureKey(pool._source)})`;
-  if (pool instanceof ConcatPool) return `cat(${poolStructureKey(pool._a)},${poolStructureKey(pool._b)})`;
-  if (pool instanceof EmptyPool) return `empty`;
-  if (pool instanceof LazyPool) return `lazy`;
+  if (pool instanceof ConditionalPool) return `when(${poolStructureKey(pool._source)})`;
+  if (pool instanceof AddWhenPool)     return `addWhen(${poolStructureKey(pool._source)})`;
+  if (pool instanceof ThenPool)        return `morph(${poolStructureKey(pool._source)})`;
+  if (pool instanceof ConcatPool)      return `cat(${poolStructureKey(pool._a)},${poolStructureKey(pool._b)})`;
+  if (pool instanceof EmptyPool)       return `empty`;
+  if (pool instanceof LazyPool)        return `lazy`;
   return `pool(d${pool.type.sides},n${pool._n},[${pool._ops.map(o=>o.op+o.args).join(',')}])`;
 }
 
@@ -581,10 +639,128 @@ class LazyPool extends Pool {
     return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
   }
   get size() { return this._materialize().size; }
-  addDice(x) { return this._materialize().addDice(x); }
+  addDice(x, y, z) { return this._materialize().addDice(x, y, z); }
   keepHigh(n, dir=1) { return this._materialize().keepHigh(n, dir); }
   keepLow(n, dir=1) { return this._materialize().keepLow(n, dir); }
-  then(fn) { return this._materialize().then(fn); }
+  morph(fn) { return this._materialize().morph(fn); }
+}
+
+// ----------------------------------------------------------------
+// ConditionalPool — pool.when(condition, result)
+// For each concrete outcome: if condition fires, resolve to result;
+// otherwise pass the outcome through unchanged.
+// ----------------------------------------------------------------
+class ConditionalPool extends Pool {
+  constructor(source, condition, result) {
+    super(source.type, source.size);
+    this._source = source;
+    this._condition = condition;
+    this._result = result;
+  }
+
+  _test(dice, types) {
+    const c = this._condition;
+    if (c instanceof DieCondition) return c.test(dice, types);
+    if (typeof c === 'function')   return c(dice, types);
+    return false;
+  }
+
+  _applyResult(dice, types, srcPools, cutoff) {
+    if (this._result instanceof LazyDiscard) {
+      if (_mode === 'roll') {
+        return [{
+          dice:  [],
+          types: [],
+          pools: [{dice: dice.map((v, i) => ({v, t: types[i], discarded: true}))}],
+          prob:  1,
+        }];
+      }
+      return [{dice: [], prob: 1}];
+    }
+    return resolveToOutcomes(this._result, this.type, cutoff);
+  }
+
+  _resolve(cutoff = EPSILON) {
+    if (_mode === 'roll') {
+      const [{dice, types, pools: srcPools}] = this._source._resolve();
+      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
+      if (this._test(dice, eff)) return this._applyResult(dice, eff, srcPools, cutoff);
+      return [{dice, types: eff, pools: srcPools, prob: 1}];
+    }
+
+    const parts = [];
+    for (const {dice, types, pools: srcPools, prob, groups} of this._source._resolve(cutoff)) {
+      if (prob < EPSILON) continue;
+      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
+      const resolved = this._test(dice, eff)
+        ? this._applyResult(dice, eff, srcPools, cutoff)
+        : [{dice, types: eff, pools: srcPools, groups, prob: 1}];
+      parts.push({outcomes: resolved, weight: prob});
+    }
+    const raw = mergeWeighted(parts);
+    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
+    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
+  }
+}
+
+// ----------------------------------------------------------------
+// AddWhenPool — pool.addWhen(condition, extra)
+// Adds the extra pool's dice ON TOP of the current concrete outcome
+// when condition fires, rather than replacing the outcome.
+// ----------------------------------------------------------------
+class AddWhenPool extends Pool {
+  constructor(source, condition, extra) {
+    super(source.type, source.size);
+    this._source = source;
+    this._condition = condition;
+    this._extra = extra;
+  }
+
+  _test(dice, types) {
+    const c = this._condition;
+    if (c instanceof DieCondition) return c.test(dice, types);
+    if (typeof c === 'function')   return c(dice, types);
+    return false;
+  }
+
+  _resolve(cutoff = EPSILON) {
+    if (_mode === 'roll') {
+      const [{dice, types, pools: srcPools}] = this._source._resolve();
+      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
+      if (!this._test(dice, eff)) return [{dice, types: eff, pools: srcPools, prob: 1}];
+      const [{dice: xd, types: xt, pools: xPools}] = resolveToOutcomes(this._extra, this.type, cutoff);
+      let newPools;
+      if (this.poolName) {
+        const entry = {name: this.poolName};
+        if (xPools && xPools.length) { entry.dice = xPools[0].dice || []; if (xPools.length > 1) entry.pools = xPools.slice(1); }
+        newPools = [...(srcPools||[]), entry];
+      } else {
+        newPools = [...(srcPools||[]), ...(xPools||[])];
+      }
+      return [{dice: [...dice, ...xd], types: [...eff, ...(Array.isArray(xt) ? xt : xd.map(() => this.type))], pools: newPools, prob: 1}];
+    }
+
+    const parts = [];
+    for (const {dice, types, pools: srcPools, prob, groups} of this._source._resolve(cutoff)) {
+      if (prob < EPSILON) continue;
+      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
+      if (!this._test(dice, eff)) {
+        parts.push({outcomes: [{dice, types: eff, pools: srcPools, groups, prob: 1}], weight: prob});
+        continue;
+      }
+      const xOutcomes = resolveToOutcomes(this._extra, this.type, cutoff);
+      const combined = xOutcomes.map(({dice: xd, types: xt, prob: xp, groups: xg}) => ({
+        dice:   [...dice, ...xd],
+        types:  [...eff, ...(Array.isArray(xt) ? xt : xd.map(() => this.type))],
+        prob:   xp,
+        groups: (groups || xg) ? {...(groups||{}), ...(xg||{})} : undefined,
+      }));
+      parts.push({outcomes: combined, weight: prob});
+    }
+    const raw = mergeWeighted(parts);
+    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
+    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
+  }
 }
 
 // ----------------------------------------------------------------
@@ -626,10 +802,11 @@ class ThenPool extends Pool {
 // ----------------------------------------------------------------
 class ConcatPool extends Pool {
   constructor(a, b) {
-    super(a.type, a.size + b.size);
+    super(a.type, 0);
     this._a = a;
     this._b = b;
   }
+  get size() { return this._a.size + this._b.size; }
   _resolve(cutoff = EPSILON) {
     if (_mode === 'roll') {
       const [a] = this._a._resolve();
@@ -707,6 +884,64 @@ class DiscardedPool extends Pool {
 class SelfRefPlaceholder extends Pool {
   constructor(type) { super(type || new DieType(6), 0); }
   _resolve() { return [{dice: ['__SELFREF__'], prob: 1}]; }
+}
+
+// ----------------------------------------------------------------
+// ConditionalBuilder — returned by pool.when(cond) (single-arg form)
+// Captures a condition then applies the next chained operation:
+//   false/null/undefined  → skip (return pool unchanged)
+//   DieCondition          → runtime conditional via AddWhenPool or ConditionalPool
+//   other truthy          → apply unconditionally
+// ----------------------------------------------------------------
+class ConditionalBuilder {
+  constructor(pool, cond) {
+    this._pool = pool;
+    this._cond = cond;
+  }
+
+  _isFalsy() { return this._cond === false || this._cond === null || this._cond === undefined; }
+
+  keepHigh(n) {
+    if (this._isFalsy()) return this._pool;
+    return this._pool.keepHigh(n);
+  }
+
+  keepLow(n) {
+    if (this._isFalsy()) return this._pool;
+    return this._pool.keepLow(n);
+  }
+
+  addDice(extra, name) {
+    if (this._isFalsy()) return this._pool;
+    if (this._cond instanceof DieCondition) return this._pool.addDice(this._cond, extra, name);
+    return this._pool.addDice(extra, name);
+  }
+
+  addBonus(n, name) {
+    if (this._isFalsy()) return this._pool;
+    if (this._cond instanceof DieCondition)
+      return this._pool.addDice(this._cond, new Pool(this._pool.type, 0).addBonus(n, name));
+    return this._pool.addBonus(n, name);
+  }
+
+  discard() {
+    if (this._isFalsy()) return this._pool;
+    if (this._cond instanceof DieCondition) return this._pool.when(this._cond, this._pool.discard());
+    return this._pool.when(() => true, this._pool.discard());
+  }
+
+  when(cond, result) {
+    if (result !== undefined) {
+      if (this._isFalsy()) return this._pool;
+      return this._pool.when(cond, result);
+    }
+    // Single-arg chaining: combine conditions
+    if (this._isFalsy() || cond === false || cond === null || cond === undefined)
+      return new ConditionalBuilder(this._pool, false);
+    if (this._cond instanceof DieCondition) return new ConditionalBuilder(this._pool, this._cond);
+    if (cond instanceof DieCondition)       return new ConditionalBuilder(this._pool, cond);
+    return new ConditionalBuilder(this._pool, true);
+  }
 }
 
 // ----------------------------------------------------------------
@@ -817,6 +1052,13 @@ export function pool(x, n) {
 }
 
 export const coercePool = pool;
+
+export function poolBuilder(fn) {
+  return function(base, ...rest) {
+    const p = pool(base);
+    return new LazyPool(() => fn(p, ...rest));
+  };
+}
 
 function defaultKey(args) {
   return args.map(a =>

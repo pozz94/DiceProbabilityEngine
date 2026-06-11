@@ -144,3 +144,7 @@ window._editor = monaco.editor.create(document.getElementById('monaco-container'
 });
 
 window._editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
+
+document.fonts.load('13px "DM Mono"').then(() => {
+  window._editor.remeasureFonts();
+});

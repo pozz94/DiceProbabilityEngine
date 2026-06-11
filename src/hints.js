@@ -14,24 +14,45 @@ declare class DieType {
   readonly name: string;
 }
 
+declare class DieRef {
+  /** True when this die showed its maximum face. */
+  readonly isMax: DieCondition;
+  /** True when this die showed its minimum face. */
+  readonly isMin: DieCondition;
+}
+
+/** Lazy condition created by pool[n].isMax / pool[n].isMin. Pass to pool.when(). */
+declare class DieCondition {}
+
+/** Discard sentinel returned by pool.discard(). Pass as the result argument of .when(). */
+declare class LazyDiscard {}
+
 declare class Pool {
   readonly type: DieType;
   readonly size: number;
+  /** pool[n] returns a DieRef for use in .when() conditions. */
+  [n: number]: DieRef;
   /** Add more dice of the same type, or concatenate another Pool. */
   addDice(poolOrN: Pool | number, poolName?: string): Pool;
+  /** Conditionally append extra dice when a DieCondition fires (additive — keeps current dice and adds more). */
+  addDice(condition: DieCondition, extra: Pool, name?: string): Pool;
   /** Add a fixed bonus value as a named constant die. */
   addBonus(n: number, poolName?: string): Pool;
   /** Keep the highest \`n\` dice. */
   keepHigh(n: number): Pool;
   /** Keep the lowest \`n\` dice. */
   keepLow(n: number): Pool;
-  /** Branch on each concrete outcome; return the new Pool from \`fn\`. */
-  then(fn: (kept: Kept) => Pool | number | null): Pool;
+  /** If condition fires for a concrete outcome, resolve to result; otherwise pass through. Chain freely. */
+  when(condition: DieCondition | ((dice: number[], types: DieType[]) => boolean), result: Pool | LazyDiscard | number | null): Pool;
+  /** Returns a LazyDiscard — use as the result of .when() to discard this outcome's dice. */
+  discard(): LazyDiscard;
+  /** Low-level escape hatch: iterate every concrete outcome via a callback. */
+  morph(fn: (kept: Kept) => Pool | number | null): Pool;
   /** Compute the full probability distribution as a Map<value, probability>. */
   toPMF(): Map<number, number>;
 }
 
-/** A concrete roll outcome passed into .then() callbacks. */
+/** A concrete roll outcome passed into .morph() callbacks. */
 declare interface Kept {
   readonly dice: number[];
   readonly size: number;
@@ -140,6 +161,14 @@ declare function coercePool(x: Pool | Pool[] | DieType | null): Pool;
 declare function memoize<T extends (...args: any[]) => Pool>(fn: T, keyFn?: (...args: any[]) => string): T;
 
 /**
+ * Wrap a recursive pool function so that self-referential calls are evaluated
+ * lazily, avoiding infinite recursion at construction time.
+ * Use this whenever your pool-returning function calls itself (e.g. exploding
+ * dice, depth-limited recursion).
+ */
+declare function poolBuilder<T extends (...args: any[]) => Pool>(fn: T): T;
+
+/**
  * Compute the full probability distribution of a Pool.
  * Returns mean, median, mode, stddev, min, max, percentiles, and raw outcomes.
  */
@@ -229,90 +258,90 @@ declare function displayCumulative(
 // `required: false` marks optional parameters (shown greyed-out in the popup).
 const SIGNATURES = {
   display: {
-    doc: 'Render the probability distribution of a Pool.',
+    doc: 'display() — bar chart of every possible total and its probability. The main output function — call it once per pool you want to analyse.',
     params: [
-      { label: 'pool: Pool | StatsResult',                          doc: 'The pool to analyse.' },
-      { label: 'label?: string',                                    doc: 'Chart title shown in the output pane.', required: false },
-      { label: 'condition?: (dice: number[]) => boolean',           doc: 'Pass/fail function — adds a coloured bar.', required: false },
-      { label: 'opts?: { cutoff?: number }',                        doc: 'Trim low-probability tail bars.', required: false },
+      { label: 'pool: Pool | StatsResult',                          doc: 'pool — the pool to analyse.' },
+      { label: 'label?: string',                                    doc: 'label — chart title shown in the output pane.', required: false },
+      { label: 'condition?: (dice: number[]) => boolean',           doc: 'condition — pass/fail function; adds a coloured bar.', required: false },
+      { label: 'opts?: { cutoff?: number }',                        doc: 'opts.cutoff — trim bars below this probability.', required: false },
     ],
   },
   displayRoll: {
-    doc: 'Render a single concrete roll result with a reroll button.',
+    doc: 'Simulates one roll and shows the concrete result with a reroll button. Use instead of display() when you want to show an actual roll rather than the full distribution.',
     params: [
-      { label: 'pool: Pool | RollResult',   doc: 'The pool to roll, or an existing RollResult.' },
-      { label: 'label?: string',            doc: 'Title shown above the roll.', required: false },
+      { label: 'pool: Pool | RollResult',   doc: 'pool — the pool to roll, or an existing RollResult.' },
+      { label: 'label?: string',            doc: 'label — title shown above the roll.', required: false },
     ],
   },
   displayScaling: {
-    doc: 'Render how a statistic changes as a parameter scales.',
+    doc: 'Charts how a pool\'s probability or expected value changes as a parameter varies. Use this to compare mechanics across different dice counts, spell levels, or other scaling inputs.',
     params: [
-      { label: 'poolFn: (n: number) => Pool  |  pools: Pool[]',    doc: 'A function of n returning a Pool, or an array of Pools.' },
-      { label: 'range: { from?, to?, step? }  |  { labels? }',     doc: 'Numeric range or explicit label array.' },
-      { label: 'label?: string',                                    doc: 'Chart title.', required: false },
-      { label: 'condition?: (dice: number[]) => boolean | DegreeSpec[]', doc: 'Pass/fail function or degree-of-success spec array.', required: false },
-      { label: "opts?: { mode: 'ev' | 'pct' }",                    doc: "Display mode: 'ev' = expected value bars, 'pct' = stacked %.", required: false },
+      { label: 'poolFn: (n: number) => Pool  |  pools: Pool[]',    doc: 'poolFn / pools — a function of n returning a Pool, or an array of Pools.' },
+      { label: 'range: { from?, to?, step? }  |  { labels? }',     doc: 'range — numeric range or explicit label array for the x-axis.' },
+      { label: 'label?: string',                                    doc: 'label — chart title.', required: false },
+      { label: 'condition?: (dice: number[]) => boolean | DegreeSpec[]', doc: 'condition — pass/fail function or degree-of-success spec array.', required: false },
+      { label: "opts?: { mode: 'ev' | 'pct' }",                    doc: "opts.mode — 'ev' = expected value bars, 'pct' = stacked %.", required: false },
     ],
   },
   displayCumulative: {
-    doc: 'Render cumulative probability of success over N repeated attempts.',
+    doc: 'Charts the probability of succeeding at least once over N repeated attempts. Use for "try until success" or repeated-check scenarios.',
     params: [
-      { label: 'pool: Pool | (() => Pool)',                         doc: 'Pool rolled on each attempt.' },
-      { label: 'label?: string',                                    doc: 'Chart title.', required: false },
-      { label: 'condition?: (dice: number[]) => boolean | DegreeSpec[]', doc: 'Pass/fail function or degree-of-success spec array.', required: false },
-      { label: 'opts?: { attempts?: number }',                      doc: 'Number of attempts on the x-axis (default 10).', required: false },
+      { label: 'pool: Pool | (() => Pool)',                         doc: 'pool — the pool rolled on each attempt.' },
+      { label: 'label?: string',                                    doc: 'label — chart title.', required: false },
+      { label: 'condition?: (dice: number[]) => boolean | DegreeSpec[]', doc: 'condition — pass/fail function or degree-of-success spec array.', required: false },
+      { label: 'opts?: { attempts?: number }',                      doc: 'opts.attempts — number of attempts on the x-axis (default 10).', required: false },
     ],
   },
   die: {
-    doc: 'Create a pool of 1 die with the given number of sides.',
+    doc: 'Creates a 1-die Pool with the given number of sides. Use this for arbitrary face counts; for standard dice use the built-in d4, d6, d8, d10, d12, d20 constants instead.',
     params: [
-      { label: 'sides: number',  doc: 'Number of faces (e.g. 6 for a d6).' },
-      { label: 'name?: string',  doc: 'Optional display name for this die type.', required: false },
+      { label: 'sides: number',  doc: 'sides — number of faces (e.g. 6 for a d6).' },
+      { label: 'name?: string',  doc: 'name — optional display name for this die type.', required: false },
     ],
   },
   customDie: {
-    doc: 'Create a die with arbitrary face values.',
+    doc: 'Creates a die whose faces are explicit values you provide (repeats allowed). Use for non-standard dice such as Fate/Fudge dice, Genesys dice, or faces with weighted probabilities.',
     params: [
-      { label: 'faces: number[]', doc: 'Array of face values (repeats allowed, e.g. [2,2,3,3,4,6]).' },
-      { label: 'name?: string',   doc: 'Optional display name.', required: false },
+      { label: 'faces: number[]', doc: 'faces — array of face values (repeats allowed, e.g. [2,2,3,3,4,6]).' },
+      { label: 'name?: string',   doc: 'name — optional display name.', required: false },
     ],
   },
   pool: {
-    doc: 'Coerce a Pool, array of Pools, or DieType into a single Pool.',
+    doc: 'Flattens a Pool, array of Pools, or DieType into one combined Pool. Use to merge multiple dice before passing them to display() or stats().',
     params: [
-      { label: 'x: Pool | Pool[] | DieType | null', doc: 'Value to coerce.' },
-      { label: 'n?: number',                        doc: 'Repeat n times.', required: false },
-    ],
-  },
-  coercePool: {
-    doc: 'Alias for pool(). Coerce a value into a single Pool.',
-    params: [
-      { label: 'x: Pool | Pool[] | DieType | null', doc: 'Value to coerce.' },
+      { label: 'x: Pool | Pool[] | DieType | null', doc: 'x — the value to coerce into a Pool.' },
+      { label: 'n?: number',                        doc: 'n — repeat x that many times before combining.', required: false },
     ],
   },
   memoize: {
-    doc: 'Memoize a pool-returning function by argument structure.',
+    doc: 'Wraps a pool-returning function so repeated calls with the same arguments reuse the cached Pool. Use inside displayScaling callbacks to avoid recomputing expensive pools on every step.',
     params: [
-      { label: 'fn: (...args) => Pool',              doc: 'The function to memoize.' },
-      { label: 'keyFn?: (...args) => string',        doc: 'Custom cache-key function.', required: false },
+      { label: 'fn: (...args) => Pool',              doc: 'fn — the pool-returning function to memoize.' },
+      { label: 'keyFn?: (...args) => string',        doc: 'keyFn — custom cache-key function (defaults to JSON.stringify).', required: false },
+    ],
+  },
+  poolBuilder: {
+    doc: 'Wraps a recursive pool-returning function so self-calls are deferred, preventing infinite recursion. Required whenever a pool function calls itself (exploding dice, chained rolls). The engine resolves laziness via cycle detection during distribution computation.',
+    params: [
+      { label: 'fn: (...args) => Pool', doc: 'fn — the recursive pool-returning function to wrap.' },
     ],
   },
   stats: {
-    doc: 'Compute the full probability distribution of a Pool.',
+    doc: 'Computes the full probability distribution of a pool and returns the numbers (mean, median, mode, std dev, min, max, percentiles). Use when you need the raw stats without rendering a chart.',
     params: [
-      { label: 'pool: Pool', doc: 'The pool to analyse.' },
+      { label: 'pool: Pool', doc: 'pool — the pool to analyse.' },
     ],
   },
   roll: {
-    doc: 'Sample one concrete outcome from a Pool.',
+    doc: 'Randomly samples one concrete outcome from a pool. Use for a one-off roll when you don\'t need the full distribution; pair with displayRoll() to show the result.',
     params: [
-      { label: 'pool: Pool', doc: 'The pool to roll.' },
+      { label: 'pool: Pool', doc: 'pool — the pool to roll.' },
     ],
   },
-  ev: {
-    doc: 'Sum all values in a dice outcome array.',
+  total: {
+    doc: 'Sums all values in a dice-array. Use inside condition functions — the `dice` parameter passed to your condition is the array of individual die results, and total(dice) gives you the sum.',
     params: [
-      { label: 'dice: number[]', doc: 'The dice array passed into a condition function.' },
+      { label: 'dice: number[]', doc: 'dice — the array of individual die results passed into a condition function.' },
     ],
   },
 };
@@ -320,29 +349,29 @@ const SIGNATURES = {
 // Completion items for the custom provider.
 const COMPLETIONS = [
   // display functions
-  { label: 'display',         kind: 'Function', insert: 'display($1)',                          detail: '(pool, label?, condition?, opts?) → StatsResult',   doc: 'Render the probability distribution of a Pool.' },
-  { label: 'displayRoll',     kind: 'Function', insert: 'displayRoll($1)',                      detail: '(pool, label?) → void',                             doc: 'Render a single concrete roll result with a reroll button.' },
-  { label: 'displayScaling',  kind: 'Function', insert: 'displayScaling($1)',                   detail: '(poolFn|pools, range, label?, condition?, opts?) → void', doc: 'Render how a statistic changes as a parameter scales.' },
-  { label: 'displayCumulative',kind:'Function', insert: 'displayCumulative($1)',                detail: '(pool, label?, condition?, opts?) → void',           doc: 'Render cumulative probability over N repeated attempts.' },
+  { label: 'display',          kind: 'Function', insert: 'display($1)',        sig: '(pool, label?, condition?, opts?) → StatsResult',        doc: 'Probability bar chart for every possible total of a pool.' },
+  { label: 'displayRoll',      kind: 'Function', insert: 'displayRoll($1)',    sig: '(pool, label?) → void',                                  doc: 'Simulate and show one concrete roll result with a reroll button.' },
+  { label: 'displayScaling',   kind: 'Function', insert: 'displayScaling($1)', sig: '(poolFn|pools, range, label?, condition?, opts?) → void', doc: 'Chart how a pool\'s stats change as a parameter scales.' },
+  { label: 'displayCumulative', kind:'Function', insert: 'displayCumulative($1)', sig: '(pool, label?, condition?, opts?) → void',            doc: 'Chart cumulative success probability across N repeated attempts.' },
   // engine functions
-  { label: 'die',             kind: 'Function', insert: 'die($1)',                              detail: '(sides, name?) → CallablePool',                      doc: 'Create a pool of 1 die with the given number of sides.' },
-  { label: 'customDie',       kind: 'Function', insert: 'customDie([$1])',                      detail: '(faces[], name?) → Pool',                           doc: 'Create a die with arbitrary faces.' },
-  { label: 'pool',            kind: 'Function', insert: 'pool($1)',                             detail: '(x, n?) → Pool',                                    doc: 'Coerce a Pool, array, or DieType into a single Pool.' },
-  { label: 'coercePool',      kind: 'Function', insert: 'coercePool($1)',                       detail: '(x) → Pool',                                        doc: 'Alias for pool().' },
-  { label: 'memoize',         kind: 'Function', insert: 'memoize($1)',                          detail: '(fn, keyFn?) → fn',                                 doc: 'Memoize a pool-returning function by argument structure.' },
-  { label: 'stats',           kind: 'Function', insert: 'stats($1)',                            detail: '(pool) → StatsResult',                              doc: 'Compute mean, median, mode, stddev, min, max, percentiles.' },
-  { label: 'roll',            kind: 'Function', insert: 'roll($1)',                             detail: '(pool) → RollResult',                               doc: 'Sample one concrete outcome from a Pool.' },
-  { label: 'ev',              kind: 'Function', insert: 'ev($1)',                               detail: '(dice[]) → number',                                 doc: 'Sum all values in a dice outcome array.' },
+  { label: 'die',              kind: 'Function', insert: 'die($1)',            sig: '(sides, name?) → CallablePool',                          doc: 'Create a standard die pool with N sides.' },
+  { label: 'customDie',        kind: 'Function', insert: 'customDie([$1])',    sig: '(faces[], name?) → Pool',                                doc: 'Create a die pool with arbitrary face values.' },
+  { label: 'pool',             kind: 'Function', insert: 'pool($1)',           sig: '(x, n?) → Pool',                                        doc: 'Combine a Pool, array of pools, or die type into one Pool.' },
+  { label: 'memoize',          kind: 'Function', insert: 'memoize($1)',        sig: '(fn, keyFn?) → fn',                                      doc: 'Cache a pool-returning function by argument structure.' },
+  { label: 'poolBuilder',      kind: 'Function', insert: 'poolBuilder($1)',    sig: '(fn) → fn',                                              doc: 'Wrap a recursive pool function to prevent infinite recursion at build time.' },
+  { label: 'stats',            kind: 'Function', insert: 'stats($1)',          sig: '(pool) → StatsResult',                                   doc: 'Compute full probability stats for a pool without rendering.' },
+  { label: 'roll',             kind: 'Function', insert: 'roll($1)',           sig: '(pool) → RollResult',                                    doc: 'Sample one random concrete outcome from a pool.' },
+  { label: 'total',            kind: 'Function', insert: 'total($1)',          sig: '(dice[]) → number',                                      doc: 'Sum all values in a dice array (use inside condition functions).' },
   // dice constants
-  { label: 'd2',              kind: 'Variable', insert: 'd2',                                   detail: 'CallablePool — 1d2',                                doc: 'd2(n) returns n d2s.' },
-  { label: 'd3',              kind: 'Variable', insert: 'd3',                                   detail: 'CallablePool — 1d3',                                doc: 'd3(n) returns n d3s.' },
-  { label: 'd4',              kind: 'Variable', insert: 'd4',                                   detail: 'CallablePool — 1d4',                                doc: 'd4(n) returns n d4s.' },
-  { label: 'd6',              kind: 'Variable', insert: 'd6',                                   detail: 'CallablePool — 1d6',                                doc: 'd6(n) returns n d6s.' },
-  { label: 'd8',              kind: 'Variable', insert: 'd8',                                   detail: 'CallablePool — 1d8',                                doc: 'd8(n) returns n d8s.' },
-  { label: 'd10',             kind: 'Variable', insert: 'd10',                                  detail: 'CallablePool — 1d10',                               doc: 'd10(n) returns n d10s.' },
-  { label: 'd12',             kind: 'Variable', insert: 'd12',                                  detail: 'CallablePool — 1d12',                               doc: 'd12(n) returns n d12s.' },
-  { label: 'd20',             kind: 'Variable', insert: 'd20',                                  detail: 'CallablePool — 1d20',                               doc: 'd20(n) returns n d20s.' },
-  { label: 'd100',            kind: 'Variable', insert: 'd100',                                 detail: 'CallablePool — 1d100',                              doc: 'd100(n) returns n d100s.' },
+  { label: 'd2',   kind: 'Variable', insert: 'd2',   sig: 'CallablePool — 1d2',   doc: 'Pre-built 1d2 pool. Call as d2(n) to get n d2s.' },
+  { label: 'd3',   kind: 'Variable', insert: 'd3',   sig: 'CallablePool — 1d3',   doc: 'Pre-built 1d3 pool. Call as d3(n) to get n d3s.' },
+  { label: 'd4',   kind: 'Variable', insert: 'd4',   sig: 'CallablePool — 1d4',   doc: 'Pre-built 1d4 pool. Call as d4(n) to get n d4s.' },
+  { label: 'd6',   kind: 'Variable', insert: 'd6',   sig: 'CallablePool — 1d6',   doc: 'Pre-built 1d6 pool. Call as d6(n) to get n d6s.' },
+  { label: 'd8',   kind: 'Variable', insert: 'd8',   sig: 'CallablePool — 1d8',   doc: 'Pre-built 1d8 pool. Call as d8(n) to get n d8s.' },
+  { label: 'd10',  kind: 'Variable', insert: 'd10',  sig: 'CallablePool — 1d10',  doc: 'Pre-built 1d10 pool. Call as d10(n) to get n d10s.' },
+  { label: 'd12',  kind: 'Variable', insert: 'd12',  sig: 'CallablePool — 1d12',  doc: 'Pre-built 1d12 pool. Call as d12(n) to get n d12s.' },
+  { label: 'd20',  kind: 'Variable', insert: 'd20',  sig: 'CallablePool — 1d20',  doc: 'Pre-built 1d20 pool. Call as d20(n) to get n d20s.' },
+  { label: 'd100', kind: 'Variable', insert: 'd100', sig: 'CallablePool — 1d100', doc: 'Pre-built 1d100 pool. Call as d100(n) to get n d100s.' },
 ];
 
 export function registerHints() {
@@ -382,15 +411,19 @@ export function registerHints() {
         endColumn:       word.endColumn,
       };
       return {
-        suggestions: COMPLETIONS.map(c => ({
-          label:         c.label,
-          kind:          kindMap[c.kind],
-          detail:        c.detail,
-          documentation: { value: c.doc },
-          insertText:    c.label,
-          sortText:      '0' + c.label,
-          range,
-        })),
+        suggestions: COMPLETIONS.map(c => {
+          const sigEntry = SIGNATURES[c.label];
+          const fullDoc = sigEntry ? sigEntry.doc : c.doc;
+          return {
+            label:         c.label,
+            kind:          kindMap[c.kind],
+            detail:        c.doc,
+            documentation: { value: '```typescript\n' + c.sig + '\n```\n\n' + fullDoc },
+            insertText:    c.label,
+            sortText:      '0' + c.label,
+            range,
+          };
+        }),
       };
     },
   });
@@ -461,14 +494,16 @@ export function registerHints() {
       if (!word) return null;
       const c = COMPLETIONS.find(x => x.label === word.word);
       if (!c) return null;
+      const sigEntry = SIGNATURES[word.word];
+      const fullDoc = sigEntry ? sigEntry.doc : c.doc;
       return {
         range: new monaco.Range(
           position.lineNumber, word.startColumn,
           position.lineNumber, word.endColumn,
         ),
         contents: [
-          { value: '```typescript\n' + c.detail + '\n```' },
-          { value: c.doc },
+          { value: '```typescript\n' + c.sig + '\n```' },
+          { value: fullDoc },
         ],
       };
     },

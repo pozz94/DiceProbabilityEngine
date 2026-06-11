@@ -16,9 +16,9 @@ display(customDie([1,3,5,7,9]),    "odd d5")
 display(customDie([2,2,3,3,4,6]), "non-standard d6")`,
 
     "Advantage / disadvantage": `// Advantage and disadvantage
-display(d20(2).keepHigh(1), "d20 advantage",    dice => ev(dice) >= 10)
-display(d20,                "d20 normal",       dice => ev(dice) >= 10)
-display(d20(2).keepLow(1),  "d20 disadvantage", dice => ev(dice) >= 10)
+display(d20(2).keepHigh(1), "d20 advantage",    dice => total(dice) >= 10)
+display(d20,                "d20 normal",       dice => total(dice) >= 10)
+display(d20(2).keepLow(1),  "d20 disadvantage", dice => total(dice) >= 10)
 
 // Scaling: effect of advantage
 displayScaling(
@@ -27,7 +27,7 @@ displayScaling(
     : d20(-n + 1).keepLow(1),
   {from: -3, to: 3},
   "advantage scaling (-=disadv, +=adv)",
-  dice => ev(dice) >= 10,
+  dice => total(dice) >= 10,
   {mode: 'pct'}
 )`,
 
@@ -40,44 +40,32 @@ display(d6(6).keepHigh(3), "6d6 keep 3")`,
 
   "Attack Mechanics": {
     "Nimble attack": `// Nimble RPG: exploding dice, min=fail, max=explode
-const nimbleAttack = (base, {advantage=0, vicious=0, bonus=0}={}, first=true) => {
-  base = pool(base)
-  const p = base.addDice(Math.abs(advantage))
-  const kept = advantage < 0 ? p.keepLow(base.size) : p.keepHigh(base.size)
-  return kept.addBonus(bonus, "bonus").then(kept =>
-    kept[0]
-      .when(kept[0].isMax, kept.addDice(
-        nimbleAttack(base.addDice(vicious, "vicious"), {}, false), "explosion"
-      ))
-      .when(first ? kept[0].isMin : 0, kept.discard())
-      .otherwise(kept)
-  )
-}
+const nimbleAttack = poolBuilder((p, {advantage=0, vicious=0, bonus=0}={}, first=true) =>
+  p.addBonus(bonus, "bonus").addDice(Math.abs(advantage))
+    .when(advantage < 0).keepLow(p.size)
+    .when(advantage > 0).keepHigh(p.size)
+    .when(p[0].isMax).addDice(nimbleAttack(p.addDice(vicious, "vicious"), {}, false), "explosion")
+    .when(p[0].isMin).when(first).discard()
+)
 
 displayRoll(nimbleAttack(d6, {advantage:1, vicious:1, bonus:2}), "roll it")
-display(nimbleAttack(d6),                           "d6 base",       dice => ev(dice) > 0)
-display(nimbleAttack(d6, {advantage: 1}),           "d6 advantage",  dice => ev(dice) > 0)
-display(nimbleAttack(d6, {vicious:1, bonus:2}),     "d6 vicious+bonus", dice => ev(dice) > 0)`,
+display(nimbleAttack(d6),                           "d6 base",          dice => total(dice) > 0)
+display(nimbleAttack(d6, {advantage: 1}),           "d6 advantage",     dice => total(dice) > 0)
+display(nimbleAttack(d6, {vicious:1, bonus:2}),     "d6 vicious+bonus", dice => total(dice) > 0)`,
 
     "Weapon comparison": `// Compare weapons by expected damage + hit distribution
-const nimbleAttack = (base, {advantage=0, vicious=0, bonus=0}={}, first=true) => {
-  base = pool(base)
-  const p = base.addDice(Math.abs(advantage))
-  const kept = advantage < 0 ? p.keepLow(base.size) : p.keepHigh(base.size)
-  return kept.addBonus(bonus, "bonus").then(kept =>
-    kept[0]
-      .when(kept[0].isMax, kept.addDice(
-        nimbleAttack(base.addDice(vicious, "vicious"), {}, false), "explosion"
-      ))
-      .when(first ? kept[0].isMin : 0, kept.discard())
-      .otherwise(kept)
-  )
-}
+const nimbleAttack = poolBuilder((p, {advantage=0, vicious=0, bonus=0}={}, first=true) =>
+  p.addBonus(bonus, "bonus").addDice(Math.abs(advantage))
+    .when(advantage < 0).keepLow(p.size)
+    .when(advantage > 0).keepHigh(p.size)
+    .when(p[0].isMax).addDice(nimbleAttack(p.addDice(vicious, "vicious"), {}, false), "explosion")
+    .when(p[0].isMin).when(first).discard()
+)
 
 const degrees = [
-  {label: "miss", color: "#ef4444", fn: dice => ev(dice) === 0},
-  {label: "hit",  color: "#60c8f0", fn: dice => ev(dice) > 0 && ev(dice) < 8},
-  {label: "big",  color: "#a3e635", fn: dice => ev(dice) >= 8},
+  {label: "miss", color: "#ef4444", fn: dice => total(dice) === 0},
+  {label: "hit",  color: "#60c8f0", fn: dice => total(dice) > 0 && total(dice) < 8},
+  {label: "big",  color: "#a3e635", fn: dice => total(dice) >= 8},
 ]
 
 displayScaling(
@@ -95,28 +83,22 @@ displayScaling(
 )`,
 
     "Die size scaling": `// How does die size affect nimble attack?
-const nimbleAttack = (base, {advantage=0, vicious=0, bonus=0}={}, first=true) => {
-  base = pool(base)
-  const p = base.addDice(Math.abs(advantage))
-  const kept = advantage < 0 ? p.keepLow(base.size) : p.keepHigh(base.size)
-  return kept.addBonus(bonus, "bonus").then(kept =>
-    kept[0]
-      .when(kept[0].isMax, kept.addDice(
-        nimbleAttack(base.addDice(vicious, "vicious"), {}, false), "explosion"
-      ))
-      .when(first ? kept[0].isMin : 0, kept.discard())
-      .otherwise(kept)
-  )
-}
+const nimbleAttack = poolBuilder((p, {advantage=0, vicious=0, bonus=0}={}, first=true) =>
+  p.addBonus(bonus, "bonus").addDice(Math.abs(advantage))
+    .when(advantage < 0).keepLow(p.size)
+    .when(advantage > 0).keepHigh(p.size)
+    .when(p[0].isMax).addDice(nimbleAttack(p.addDice(vicious, "vicious"), {}, false), "explosion")
+    .when(p[0].isMin).when(first).discard()
+)
 
 displayScaling(
   n => nimbleAttack(die(n), {vicious:1}),
   {from: 4, to: 12, step: 2},
   "nimble attack by die size (vicious 1)",
   [
-    {label: "miss", color: "#ef4444", fn: dice => ev(dice) === 0},
-    {label: "hit",  color: "#60c8f0", fn: dice => ev(dice) > 0 && ev(dice) < 10},
-    {label: "big",  color: "#a3e635", fn: dice => ev(dice) >= 10},
+    {label: "miss", color: "#ef4444", fn: dice => total(dice) === 0},
+    {label: "hit",  color: "#60c8f0", fn: dice => total(dice) > 0 && total(dice) < 10},
+    {label: "big",  color: "#a3e635", fn: dice => total(dice) >= 10},
   ],
   {mode: 'pct'}
 )`,
@@ -128,7 +110,7 @@ displayScaling(
   n => d6(n),
   {from: 1, to: 6},
   "Nd6 pool vs target 10",
-  dice => ev(dice) >= 10,
+  dice => total(dice) >= 10,
   {mode: 'pct'}
 )
 
@@ -136,7 +118,7 @@ displayScaling(
   n => d6(n).keepHigh(1),
   {from: 1, to: 6},
   "Nd6 keep best vs target 4",
-  dice => ev(dice) >= 4,
+  dice => total(dice) >= 4,
   {mode: 'pct'}
 )`,
 
@@ -159,21 +141,18 @@ displayScaling(
   n => d6(n),
   {from: 1, to: 5},
   "attacker pool size (vs 2d6 defender)",
-  dice => ev(dice) > 7,
+  dice => total(dice) > 7,
   {mode: 'pct'}
 )`,
   },
 
   "Advanced": {
-    "Exploding dice": `// Pure exploding d6: re-roll and add on max
-const explode = (base, depth=0) => {
+    "Exploding dice": `// Pure exploding d6: keep max and add another roll on top
+const explode = poolBuilder((base, depth=0) => {
   if (depth > 8) return pool(base)
-  return pool(base).then(kept =>
-    kept[0]
-      .when(kept[0].isMax, kept.addDice(explode(base, depth+1), "chain"))
-      .otherwise(kept)
-  )
-}
+  const p = pool(base)
+  return p.addDice(p[0].isMax, explode(base, depth+1), "chain")
+})
 
 display(explode(d6),  "exploding d6")
 display(explode(d8),  "exploding d8")
@@ -192,7 +171,7 @@ displayScaling(
   ],
   {labels: ["skewed 2d6","normal 2d6","swingy 2d6"]},
   "custom die comparison",
-  dice => ev(dice) >= 7,
+  dice => total(dice) >= 7,
   {mode: 'pct'}
 )`,
   },
@@ -202,14 +181,14 @@ displayScaling(
 displayCumulative(
   d6(3),
   "3d6 — P(sum ≥ 7) over N attempts",
-  dice => ev(dice) >= 7,
+  dice => total(dice) >= 7,
   {attempts: 8}
 )
 
 displayCumulative(
   d6(3),
   "3d6 — P(sum ≥ 12) over N attempts",
-  dice => ev(dice) >= 12,
+  dice => total(dice) >= 12,
   {attempts: 12}
 )`,
 
@@ -229,37 +208,30 @@ displayCumulative(
 displayCumulative(
   d6,
   "d6 encounter — P(at least one in N days)",
-  dice => ev(dice) === 1,
+  dice => total(dice) === 1,
   {attempts: 14}
 )
 
 displayCumulative(
   d6(2),
   "2d6 encounter — P(snake eyes in N days)",
-  dice => ev(dice) === 2,
+  dice => total(dice) === 2,
   {attempts: 20}
 )`,
 
     "Critical hits": `// P(at least one crit) over N attacks
-const nimbleAttack = (base, opts={}, first=true) => {
-  base = pool(base)
-  const kept = base.keepHigh(base.size)
-  return kept.then(kept =>
-    kept[0]
-      .when(kept[0].isMax, kept.addDice(
-        nimbleAttack(base, {}, false), "explosion"
-      ))
-      .when(first ? kept[0].isMin : 0, kept.discard())
-      .otherwise(kept)
-  )
-}
+const nimbleAttack = poolBuilder((p, opts={}, first=true) =>
+  p.keepHigh(p.size)
+    .when(p[0].isMax).addDice(nimbleAttack(p, {}, false), "explosion")
+    .when(p[0].isMin).when(first).discard()
+)
 
 displayCumulative(
   nimbleAttack(d6),
   "P(at least one big hit) in N attacks",
   [
-    {label: "hit",      color: "#60c8f0", fn: dice => ev(dice) > 0 && ev(dice) < 10},
-    {label: "big hit",  color: "#a3e635", fn: dice => ev(dice) >= 10},
+    {label: "hit",      color: "#60c8f0", fn: dice => total(dice) > 0 && total(dice) < 10},
+    {label: "big hit",  color: "#a3e635", fn: dice => total(dice) >= 10},
   ],
   {attempts: 10}
 )`,

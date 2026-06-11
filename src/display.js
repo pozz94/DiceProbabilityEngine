@@ -1,7 +1,24 @@
 import {
-  Pool, coercePool, die, customDie, memoize, stats, roll,
+  Pool, coercePool, die, customDie, memoize, stats, roll, poolBuilder,
   _pendingKeys, _resolvedCache, resetEngineState,
 } from './engine.js';
+
+// Arrays can be used anywhere a Pool is expected.
+// Non-enumerable so for...in loops on arrays are unaffected.
+// NOTE: 'then' is intentionally omitted — it would make arrays thenable,
+//       causing them to be unwrapped by Promise resolution.
+for (const [name, fn] of [
+  ['keepHigh', function(n)       { return coercePool(this).keepHigh(n); }],
+  ['keepLow',  function(n)       { return coercePool(this).keepLow(n); }],
+  ['addDice',  function(p, q, r) { return coercePool(this).addDice(p, q, r); }],
+  ['addBonus', function(n, name) { return coercePool(this).addBonus(n, name); }],
+  ['when',     function(c, r)    { return coercePool(this).when(c, r); }],
+  ['discard',  function()        { return coercePool(this).discard(); }],
+]) {
+  Object.defineProperty(Array.prototype, name, {
+    value: fn, writable: true, configurable: true, enumerable: false,
+  });
+}
 import {
   esc,
   renderError, renderRollBlock, renderScalingBlock,
@@ -157,10 +174,11 @@ export function runCode(getEditorValue) {
   resetEngineState();
 
   const rt = {
-    pool: coercePool, die, customDie, coercePool, memoize,
+    pool: coercePool, die, customDie, memoize, poolBuilder,
     stats, roll,
     display, displayRoll, displayScaling, displayCumulative,
-    ev: dice => dice.reduce((a,b) => a+b, 0),
+    total: dice => dice.reduce((a, b) => a + b, 0),
+    ev:    dice => dice.reduce((a, b) => a + b, 0), // legacy alias
     console: {log: (...args) => _logs.push(args.map(fmtVal).join(' '))},
   };
   for (const n of [2, 3, 4, 6, 8, 10, 12, 20, 100]) rt[`d${n}`] = die(n);
