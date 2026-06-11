@@ -4,7 +4,12 @@
       "WebFetch(domain:microsoft.github.io)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:gist.github.com)"
+      "WebFetch(domain:gist.github.com)",
+      "Bash(npm init *)",
+      "Bash(npm install *)",
+      "Bash(Test-Path \"c:\\\\Users\\\\davide.pozzani\\\\Documents\\\\Progetti\\\\NODE\\\\DiceProbabilityEngine\\\\node_modules\\\\vite\")",
+      "Bash(npm run *)",
+      "Bash(npm uninstall *)"
     ]
   }
 }

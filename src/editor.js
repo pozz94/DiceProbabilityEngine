@@ -1,10 +1,16 @@
-import { EXAMPLES, toggleExampleMenu, closeExampleMenu } from './examples.js';
+import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
+
+// Must be set before monaco is imported
+self.MonacoEnvironment = {
+  getWorker(_moduleId, label) {
+    return new editorWorker();
+  },
+};
+
+import * as monaco from 'monaco-editor';
+import { EXAMPLES, toggleExampleMenu } from './examples.js';
 import { runCode } from './display.js';
 import { registerHints } from './hints.js';
-
-// ================================================================
-// Monaco editor initialisation — single entry point for the app
-// ================================================================
 
 // Suppress the benign ResizeObserver loop notification
 const _OriginalResizeObserver = window.ResizeObserver;
@@ -41,104 +47,100 @@ document.addEventListener('keydown', e => {
   }
 });
 
-require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
-
-require(['vs/editor/editor.main'], () => {
-  // Register 'dicescript' as a language that uses JavaScript tokenization
-  // but has NO built-in worker or intellisense. This prevents Monaco's JS
-  // language service from registering its own completion provider (which hangs
-  // with a no-op worker and shows "Loading..." forever).
-  monaco.languages.register({ id: 'dicescript' });
-  monaco.languages.setLanguageConfiguration('dicescript', {
-    comments: { lineComment: '//', blockComment: ['/*', '*/'] },
-    brackets: [['(', ')'], ['[', ']'], ['{', '}']],
-    autoClosingPairs: [
-      { open: '(', close: ')' },
-      { open: '[', close: ']' },
-      { open: '{', close: '}' },
-      { open: "'", close: "'", notIn: ['string', 'comment'] },
-      { open: '"', close: '"', notIn: ['string'] },
-      { open: '`', close: '`', notIn: ['string'] },
-    ],
-    surroundingPairs: [
-      { open: '(', close: ')' },
-      { open: '[', close: ']' },
-      { open: '{', close: '}' },
-      { open: "'", close: "'" },
-      { open: '"', close: '"' },
-      { open: '`', close: '`' },
-    ],
-    indentationRules: {
-      increaseIndentPattern: /^.*\{[^}"'`]*$/,
-      decreaseIndentPattern: /^\s*\}/,
-    },
-  });
-
-  // Reuse Monaco's built-in JavaScript monarch tokenizer for syntax highlighting.
-  const jsLang = monaco.languages.getLanguages().find(l => l.id === 'javascript');
-  if (jsLang && jsLang.loader) {
-    jsLang.loader().then(({ language }) => {
-      monaco.languages.setMonarchTokensProvider('dicescript', language);
-    });
-  }
-
-  registerHints();
-
-  monaco.editor.defineTheme('diceTheme', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: 'comment',    foreground: '4a4a5a', fontStyle: 'italic' },
-      { token: 'keyword',    foreground: '60c8f0' },
-      { token: 'number',     foreground: 'f060a8' },
-      { token: 'string',     foreground: 'c8f060' },
-      { token: 'identifier', foreground: 'e8e8f0' },
-    ],
-    colors: {
-      'editor.background':                  '#0e0e10',
-      'editor.foreground':                  '#e8e8f0',
-      'editorLineNumber.foreground':        '#2a2a35',
-      'editorLineNumber.activeForeground':  '#6a6a80',
-      'editor.lineHighlightBackground':     '#16161a',
-      'editorCursor.foreground':            '#c8f060',
-      'editor.selectionBackground':         '#2a2a35',
-      'editorWidget.background':            '#1e1e24',
-      'editorSuggestWidget.background':     '#1e1e24',
-      'editorSuggestWidget.border':         '#2a2a35',
-      'scrollbarSlider.background':         '#2a2a3580',
-      'scrollbarSlider.hoverBackground':    '#2a2a35cc',
-    }
-  });
-
-  window._editor = monaco.editor.create(document.getElementById('monaco-container'), {
-    value: EXAMPLES['Dice Basics']['Simple dice'],
-    language: 'dicescript',
-    theme: 'diceTheme',
-    fontSize: 13,
-    lineHeight: 22,
-    fontFamily: "'DM Mono', monospace",
-    minimap: { enabled: false },
-    scrollBeyondLastLine: false,
-    renderLineHighlight: 'line',
-    overviewRulerLanes: 0,
-    hideCursorInOverviewRuler: true,
-    overviewRulerBorder: false,
-    folding: false,
-    lineNumbers: 'on',
-    glyphMargin: false,
-    lineDecorationsWidth: 0,
-    lineNumbersMinChars: 3,
-    padding: { top: 12, bottom: 12 },
-    tabSize: 2,
-    wordWrap: 'off',
-    automaticLayout: true,
-    scrollbar: { verticalScrollbarSize: 6, horizontalScrollbarSize: 6 },
-    quickSuggestions: true,
-    suggestOnTriggerCharacters: true,
-    acceptSuggestionOnEnter: 'on',
-    tabCompletion: 'on',
-    suggest: { snippetsPreventQuickSuggestions: false },
-  });
-
-  window._editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
+// Register 'dicescript' as a language that uses JavaScript tokenization
+// but has NO built-in worker or intellisense. This prevents Monaco's JS
+// language service from registering its own completion provider (which hangs
+// with a no-op worker and shows "Loading..." forever).
+monaco.languages.register({ id: 'dicescript' });
+monaco.languages.setLanguageConfiguration('dicescript', {
+  comments: { lineComment: '//', blockComment: ['/*', '*/'] },
+  brackets: [['(', ')'], ['[', ']'], ['{', '}']],
+  autoClosingPairs: [
+    { open: '(', close: ')' },
+    { open: '[', close: ']' },
+    { open: '{', close: '}' },
+    { open: "'", close: "'", notIn: ['string', 'comment'] },
+    { open: '"', close: '"', notIn: ['string'] },
+    { open: '`', close: '`', notIn: ['string'] },
+  ],
+  surroundingPairs: [
+    { open: '(', close: ')' },
+    { open: '[', close: ']' },
+    { open: '{', close: '}' },
+    { open: "'", close: "'" },
+    { open: '"', close: '"' },
+    { open: '`', close: '`' },
+  ],
+  indentationRules: {
+    increaseIndentPattern: /^.*\{[^}"'`]*$/,
+    decreaseIndentPattern: /^\s*\}/,
+  },
 });
+
+// Reuse Monaco's built-in JavaScript monarch tokenizer for syntax highlighting.
+const jsLang = monaco.languages.getLanguages().find(l => l.id === 'javascript');
+if (jsLang && jsLang.loader) {
+  jsLang.loader().then(({ language }) => {
+    monaco.languages.setMonarchTokensProvider('dicescript', language);
+  });
+}
+
+registerHints();
+
+monaco.editor.defineTheme('diceTheme', {
+  base: 'vs-dark',
+  inherit: true,
+  rules: [
+    { token: 'comment',    foreground: '4a4a5a', fontStyle: 'italic' },
+    { token: 'keyword',    foreground: '60c8f0' },
+    { token: 'number',     foreground: 'f060a8' },
+    { token: 'string',     foreground: 'c8f060' },
+    { token: 'identifier', foreground: 'e8e8f0' },
+  ],
+  colors: {
+    'editor.background':                  '#0e0e10',
+    'editor.foreground':                  '#e8e8f0',
+    'editorLineNumber.foreground':        '#2a2a35',
+    'editorLineNumber.activeForeground':  '#6a6a80',
+    'editor.lineHighlightBackground':     '#16161a',
+    'editorCursor.foreground':            '#c8f060',
+    'editor.selectionBackground':         '#2a2a35',
+    'editorWidget.background':            '#1e1e24',
+    'editorSuggestWidget.background':     '#1e1e24',
+    'editorSuggestWidget.border':         '#2a2a35',
+    'scrollbarSlider.background':         '#2a2a3580',
+    'scrollbarSlider.hoverBackground':    '#2a2a35cc',
+  }
+});
+
+window._editor = monaco.editor.create(document.getElementById('monaco-container'), {
+  value: EXAMPLES['Dice Basics']['Simple dice'],
+  language: 'dicescript',
+  theme: 'diceTheme',
+  fontSize: 13,
+  lineHeight: 22,
+  fontFamily: "'DM Mono', monospace",
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  renderLineHighlight: 'line',
+  overviewRulerLanes: 0,
+  hideCursorInOverviewRuler: true,
+  overviewRulerBorder: false,
+  folding: false,
+  lineNumbers: 'on',
+  glyphMargin: false,
+  lineDecorationsWidth: 0,
+  lineNumbersMinChars: 3,
+  padding: { top: 12, bottom: 12 },
+  tabSize: 2,
+  wordWrap: 'off',
+  automaticLayout: true,
+  scrollbar: { verticalScrollbarSize: 6, horizontalScrollbarSize: 6 },
+  quickSuggestions: true,
+  suggestOnTriggerCharacters: true,
+  acceptSuggestionOnEnter: 'on',
+  tabCompletion: 'on',
+  suggest: { snippetsPreventQuickSuggestions: false },
+});
+
+window._editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);

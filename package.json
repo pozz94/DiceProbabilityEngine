@@ -1,0 +1,27 @@
+{
+  "name": "diceprobabilityengine",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pozz94/DiceProbabilityEngine.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/pozz94/DiceProbabilityEngine/issues"
+  },
+  "homepage": "https://github.com/pozz94/DiceProbabilityEngine#readme",
+  "devDependencies": {
+    "monaco-editor": "^0.55.1",
+    "vite": "^8.0.16"
+  }
+}

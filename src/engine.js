@@ -55,15 +55,55 @@ export function customDie(faces, name) {
 // WeightedOutcomes helpers
 // ----------------------------------------------------------------
 
+// Precomputed factorials for multinomial coefficients (up to 200!).
+const _fact = [1];
+for (let i = 1; i <= 200; i++) _fact[i] = _fact[i-1] * i;
+
 function rollPool(type, n) {
   if (n === 0) return [{dice: [], prob: 1}];
-  const outcomes = [];
   const entries = type.pmf ? [...type.pmf.entries()] : type.faces.map(f => [f, type.faceProb]);
-  function rec(depth, current, prob) {
-    if (depth === n) { outcomes.push({dice: [...current], prob}); return; }
-    for (const [f, p] of entries) { current.push(f); rec(depth + 1, current, prob * p); current.pop(); }
+  const F = entries.length;
+
+  // For uniform dice (all faces equally likely) or any dice with n > threshold,
+  // enumerate multisets instead of all ordered combinations.
+  // Multiset count = C(n+F-1, F-1) vs F^n — dramatically fewer for large n.
+  const multisetCount = _fact[n + F - 1] / (_fact[n] * _fact[F - 1]);
+  if (multisetCount < Math.pow(F, n)) {
+    const outcomes = [];
+    // counts[i] = how many dice show entries[i][0]
+    const counts = new Array(F).fill(0);
+    function rec(faceIdx, remaining) {
+      if (faceIdx === F - 1) {
+        counts[faceIdx] = remaining;
+        // multinomial probability: n! / (c0! * c1! * ... * cF-1!) * prod(p_i ^ c_i)
+        let prob = _fact[n];
+        let dice = [];
+        for (let i = 0; i < F; i++) {
+          prob *= Math.pow(entries[i][1], counts[i]) / _fact[counts[i]];
+          for (let j = 0; j < counts[i]; j++) dice.push(entries[i][0]);
+        }
+        outcomes.push({dice, prob});
+        counts[faceIdx] = 0;
+        return;
+      }
+      for (let c = 0; c <= remaining; c++) {
+        counts[faceIdx] = c;
+        rec(faceIdx + 1, remaining - c);
+      }
+      counts[faceIdx] = 0;
+    }
+    rec(0, n);
+    return outcomes;
   }
-  rec(0, [], 1);
+
+  // Fallback: full ordered enumeration (needed when keep-high/keep-low is applied,
+  // since those ops depend on which specific die rolled what).
+  const outcomes = [];
+  function recOrdered(depth, current, prob) {
+    if (depth === n) { outcomes.push({dice: [...current], prob}); return; }
+    for (const [f, p] of entries) { current.push(f); recOrdered(depth + 1, current, prob * p); current.pop(); }
+  }
+  recOrdered(0, [], 1);
   return outcomes;
 }
 
@@ -745,13 +785,15 @@ function fixPointWithGroups(raw, type) {
 // Wrap a Pool so it can also be called as a function:
 //   d6(3)  →  3 dice of the same type  (i.e. d6.addDice(2))
 // The Proxy target must itself be a function for the apply trap to fire.
+const UNWRAP = Symbol('callablePool.unwrap');
+
 function callablePool(p) {
   const fn = function(n = 1) {
     return n === 1 ? p : p.addDice(n - 1);
   };
   return new Proxy(fn, {
     apply(_target, _thisArg, args) { return fn(...args); },
-    get(_target, prop, _receiver)  { return Reflect.get(p, prop, p); },
+    get(_target, prop, _receiver)  { return prop === UNWRAP ? p : Reflect.get(p, prop, p); },
     has(_target, prop)             { return prop in p; },
     getPrototypeOf()               { return Object.getPrototypeOf(p); },
   });
@@ -766,6 +808,8 @@ export function pool(x, n) {
     if (x.length === 0) return new EmptyPool();
     return x.map(p => pool(p)).reduce((acc, p) => new ConcatPool(acc, p));
   }
+  // Unwrap CallablePool proxies to get the underlying Pool instance.
+  if (x && x[UNWRAP]) return x[UNWRAP];
   if (x instanceof Pool) return x;
   if (x instanceof DieType) return new Pool(x, n || 1);
   if (!x) return new EmptyPool();
