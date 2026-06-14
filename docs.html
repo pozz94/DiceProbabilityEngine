@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DiceScript Documentation — dice pools, probabilities & display</title>
+<meta name="description" content="Reference for DiceScript: dice and pools, reads (total, shows, highest, sample, shuffle), poolBuilder with when/discard, the standard library, and the display functions for probability charts.">
+<meta name="theme-color" content="#0e0e10">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://pozz94.github.io/DiceProbabilityEngine/docs.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="DiceScript Documentation">
+<meta property="og:description" content="The DiceScript language reference: dice, pools, reads, builders, and probability charts.">
+<meta property="og:url" content="https://pozz94.github.io/DiceProbabilityEngine/docs.html">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Instrument+Serif:ital@0;1&display=swap');
+  :root {
+    --bg:#0e0e10; --surface:#16161a; --surface2:#1e1e24; --border:#2a2a35;
+    --accent:#c8f060; --accent2:#60c8f0; --accent3:#f060a8; --text:#e8e8f0; --muted:#8a8a9a;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:'DM Mono',monospace; line-height:1.65; font-size:14px; }
+  a { color:var(--accent2); }
+  header {
+    position:sticky; top:0; z-index:10; background:var(--bg); border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:1rem; padding:0.6rem 1.25rem;
+  }
+  header .logo { font-family:'Instrument Serif',serif; font-style:italic; font-size:1.15rem; color:var(--accent); text-decoration:none; }
+  header .spacer { flex:1; }
+  header a.play { color:var(--accent); border:1px solid var(--accent); padding:0.25rem 0.7rem; border-radius:4px; text-decoration:none; font-size:0.8rem; }
+  main { max-width:860px; margin:0 auto; padding:2rem 1.25rem 5rem; }
+  h1 { font-family:'Instrument Serif',serif; font-style:italic; font-weight:400; font-size:2.4rem; color:var(--accent); margin:0.2rem 0 0.4rem; }
+  h2 { font-size:1.15rem; color:var(--accent2); margin:2.6rem 0 0.6rem; padding-top:0.6rem; border-top:1px solid var(--border); letter-spacing:0.02em; }
+  h3 { font-size:0.95rem; color:var(--text); margin:1.4rem 0 0.4rem; }
+  p, li { color:#cfcfe0; }
+  .lede { color:var(--muted); font-size:1rem; }
+  code { background:var(--surface2); padding:0.1rem 0.35rem; border-radius:3px; font-size:0.86em; color:var(--accent); }
+  pre { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:0.9rem 1rem; overflow-x:auto; }
+  pre code { background:none; padding:0; color:var(--text); }
+  .muted { color:var(--muted); }
+  table { border-collapse:collapse; width:100%; margin:0.6rem 0; font-size:0.86rem; }
+  th, td { border:1px solid var(--border); padding:0.4rem 0.6rem; text-align:left; vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  td code { white-space:nowrap; }
+  nav.toc { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:0.8rem 1rem; margin:1.5rem 0; }
+  nav.toc a { display:inline-block; margin:0.15rem 0.8rem 0.15rem 0; color:var(--muted); text-decoration:none; font-size:0.82rem; }
+  nav.toc a:hover { color:var(--accent2); }
+  footer { max-width:860px; margin:0 auto; padding:1.5rem 1.25rem 3rem; color:var(--muted); font-size:0.8rem; border-top:1px solid var(--border); }
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="./">⚄ DiceScript</a>
+  <span class="spacer"></span>
+  <a class="play" href="./">Open playground →</a>
+</header>
+
+<main>
+  <h1>DiceScript guide</h1>
+  <p class="lede">DiceScript answers questions like “what are my odds to hit?”, “is advantage worth it?”,
+  or “which weapon does more damage?” — and draws the chart. You describe a roll in the editor on the
+  left, press <strong>Run</strong>, and the chances appear on the right. <strong>You don’t need to know how to
+  program</strong> — you’ll copy a couple of small patterns and tweak the numbers.</p>
+
+  <p>The fastest way in: open the <a href="./">playground</a>, click <strong>Examples</strong>, pick one, and
+  change a number. This page explains the pieces so you can write your own.</p>
+
+  <nav class="toc">
+    <a href="#dice">1 · Dice</a>
+    <a href="#chart">2 · See the odds</a>
+    <a href="#questions">3 · Ask a question</a>
+    <a href="#mechanics">4 · Common mechanics</a>
+    <a href="#compare">5 · Compare &amp; scale</a>
+    <a href="#tries">6 · Over many tries</a>
+    <a href="#oneroll">7 · Roll once</a>
+    <a href="#controls">8 · Sliders</a>
+    <a href="#reading">9 · Reading the code</a>
+    <a href="#cheats">Cheat sheet</a>
+  </nav>
+
+  <h2 id="dice">1 · Dice</h2>
+  <p>Write dice the way you’d say them out loud:</p>
+  <table>
+    <tr><th>You write</th><th>You get</th></tr>
+    <tr><td><code>d6</code></td><td>one six-sided die. (Also <code>d4 d8 d10 d12 d20 d100…</code>)</td></tr>
+    <tr><td><code>d6(3)</code></td><td>three d6 rolled together (“3d6”)</td></tr>
+    <tr><td><code>d20(2)</code></td><td>two d20</td></tr>
+    <tr><td><code>die(7)</code></td><td>an odd-sized die (faces 1–7) — for any size not in the list</td></tr>
+    <tr><td><code>die([0, 0, 1, 2])</code></td><td>a custom die with exactly these faces (repeat a face to make it more likely)</td></tr>
+  </table>
+  <p>To mix different dice, put them in square brackets: <code>[d8, d6, d6]</code> is a d8 and two d6 rolled together.</p>
+
+  <h2 id="chart">2 · See the odds</h2>
+  <p><code>display(...)</code> draws the chart of every possible total and how likely it is. Paste this into the
+  playground and press Run:</p>
+  <pre><code>display({ pool: d6(3), title: "3d6" })</code></pre>
+  <p>The part in curly braces <code>{ … }</code> is just a list of settings: <code>pool</code> is the roll to chart,
+  <code>title</code> is the heading. You’ll also see the average, the most likely total, and so on.</p>
+  <p>You can chart several rolls at once — just call <code>display</code> again:</p>
+  <pre><code>display({ pool: d20,    title: "flat d20" })
+display({ pool: d6(3),  title: "3d6 (bell curve)" })
+display({ pool: d6(2).addBonus(3), title: "2d6 + 3" })</code></pre>
+  <p><code>.addBonus(3)</code> adds a flat +3. <code>.keepHigh(1)</code>, <code>.keepLow(1)</code> keep the best / worst die —
+  more on those below.</p>
+
+  <h2 id="questions">3 · Ask a question (“what are my chances?”)</h2>
+  <p>Add a <code>filter</code> to ask whether each roll passes. The chart then splits into pass / fail and tells you the percentage:</p>
+  <pre><code>display({
+  pool: d20,
+  filter: roll => total(roll) >= 15,    // did we hit 15 or more?
+  title: "d20 vs target 15",
+})</code></pre>
+  <p>Read <code>roll => total(roll) >= 15</code> as a plain question: <em>“given a roll, is its total at least 15?”</em>
+  The word before <code>=></code> (<code>roll</code>) is just a name for “the dice that came up”; you can call it anything.
+  <code>total(...)</code> adds the dice up.</p>
+
+  <p>For more than two outcomes, give a list of labelled categories with colors:</p>
+  <pre><code>display({
+  pool: d6(2),
+  title: "attack result",
+  filter: [
+    { when: roll => total(roll) <= 4,  label: "weak",   color: "#ef4444" },
+    { when: roll => total(roll) <= 8,  label: "solid",  color: "#facc15" },
+    { when: roll => total(roll) >= 9,  label: "strong", color: "#a3e635" },
+  ],
+})</code></pre>
+  <p>Each roll falls into the first category it matches. Handy building blocks for the <code>when</code> question:</p>
+  <table>
+    <tr><td><code>total(roll)</code></td><td>the sum of the dice</td></tr>
+    <tr><td><code>maxed(roll)</code> / <code>floored(roll)</code></td><td>the highest / lowest single die</td></tr>
+    <tr><td><code>count(roll, v => v >= 5)</code></td><td>how many dice are 5 or more (success counting)</td></tr>
+  </table>
+
+  <h2 id="mechanics">4 · Common mechanics</h2>
+
+  <h3>Advantage &amp; disadvantage</h3>
+  <p>Roll two and keep the best (or worst):</p>
+  <pre><code>display({ pool: d20(2).keepHigh(1), filter: roll => total(roll) >= 15, title: "advantage" })
+display({ pool: d20(2).keepLow(1),  filter: roll => total(roll) >= 15, title: "disadvantage" })</code></pre>
+
+  <h3>Keep the best N (4d6 drop lowest, etc.)</h3>
+  <pre><code>display({ pool: d6(4).keepHigh(3), title: "4d6 keep best 3 (ability score)" })</code></pre>
+
+  <h3>Success / dice pools</h3>
+  <p>Count how many dice beat a threshold:</p>
+  <pre><code>display({
+  pool: d6(6),
+  title: "6d6 — number of 5s and 6s",
+  filter: [
+    { when: roll => count(roll, v => v >= 5) === 0, label: "0", color: "#ef4444" },
+    { when: roll => count(roll, v => v >= 5) === 1, label: "1", color: "#facc15" },
+    { when: roll => count(roll, v => v >= 5) >= 2,  label: "2+", color: "#a3e635" },
+  ],
+})</code></pre>
+
+  <h3>A custom roll: exploding dice</h3>
+  <p>For mechanics with their own rules, define a roll with <code>poolBuilder</code>. Inside, <code>when</code> lets the
+  roll change itself based on what it shows. Here a maximum re-rolls and adds on top:</p>
+  <pre><code>const explode = poolBuilder(p =>
+  p.when(p[0].shows(max), again => again.addDice(explode(p)))
+)
+
+display({ pool: explode(d6), title: "exploding d6" })</code></pre>
+  <p>In plain terms: take the roll <code>p</code>; <strong>when</strong> its die shows its maximum (<code>shows(max)</code>),
+  add another exploding roll on top. <code>const explode = …</code> just gives the roll a name so it can refer to itself.</p>
+  <p>You can also <code>discard()</code> dice — they’re shown grayed-out but no longer count. Discarding the whole roll
+  produces a “miss” (a 0 with no result), which the chart shows as its own bar.</p>
+
+  <h2 id="compare">5 · Compare options &amp; see how things scale</h2>
+  <p><code>displayScaling</code> draws a series of bars. Give it a <strong>list of options</strong> to compare:</p>
+  <pre><code>displayScaling({
+  pool: [
+    { label: "d8",     pool: d8 },
+    { label: "2d4",    pool: d4(2) },
+    { label: "d6 + 1", pool: d6.addBonus(1) },
+  ],
+  title: "which deals more?",
+})</code></pre>
+  <p>Or sweep a number to see a trend — <code>pool: n => …</code> means “for each value <code>n</code> on the x-axis, this roll”:</p>
+  <pre><code>displayScaling({
+  pool: n => d6(n),
+  over: { from: 1, to: 8 },              // n goes 1, 2, … 8
+  filter: roll => total(roll) >= 12,
+  title: "how many d6 to beat 12?",
+})</code></pre>
+  <p>Scaling charts have an <strong>avg / %</strong> toggle: <em>avg</em> sizes each bar by its average value (compare power),
+  <em>%</em> shows the chance of each outcome (compare reliability).</p>
+
+  <h2 id="tries">6 · Over many tries</h2>
+  <p><code>displayCumulative</code> answers “how likely am I to succeed at least once in N attempts?”:</p>
+  <pre><code>displayCumulative({
+  pool: d6(3),
+  over: { attempts: 10 },
+  filter: roll => total(roll) >= 14,
+  title: "chance of a big roll within N tries",
+})</code></pre>
+
+  <h2 id="oneroll">7 · Roll once</h2>
+  <p><code>displayRoll</code> shows a single random result (with a Reroll button) instead of the full chart:</p>
+  <pre><code>displayRoll({ pool: d6(4).keepHigh(3), title: "roll an ability score" })</code></pre>
+
+  <h2 id="controls">8 · Sliders &amp; toggles</h2>
+  <p>Add controls and the chart updates as you drag them — great for “what if?”:</p>
+  <pre><code>const bonus = slider("bonus", { min: 0, max: 5, value: 0 })
+const sides = select("die", [4, 6, 8, 10, 12], { value: 6 })
+
+display({
+  pool: die(sides)(2).addBonus(bonus),
+  filter: roll => total(roll) >= 10,
+  title: "tune it",
+})</code></pre>
+  <table>
+    <tr><td><code>slider("name", { min, max, value })</code></td><td>a number you can drag</td></tr>
+    <tr><td><code>select("name", [a, b, c], { value })</code></td><td>a dropdown</td></tr>
+    <tr><td><code>toggle("name", false)</code></td><td>a checkbox (on / off)</td></tr>
+  </table>
+
+  <h2 id="reading">9 · Reading the code</h2>
+  <p>Three small bits of punctuation appear everywhere — that’s really all the “programming” there is:</p>
+  <table>
+    <tr><td><code>{ pool: …, title: … }</code></td><td>a list of <em>settings</em>: a name, a colon, a value, separated by commas.</td></tr>
+    <tr><td><code>roll => total(roll) >= 10</code></td><td>a <em>question</em> about a roll. Left of <code>=></code> names the roll; right of it is the test.</td></tr>
+    <tr><td><code>const name = …</code></td><td>give something a <em>name</em> so you can reuse it.</td></tr>
+  </table>
+  <p class="muted">Under the hood this is JavaScript, so if you do program, anything JS works (variables, <code>Math</code>, loops…).
+  But you never need more than the three patterns above.</p>
+
+  <h2 id="cheats">Cheat sheet</h2>
+  <table>
+    <tr><th>Want to…</th><th>Write</th></tr>
+    <tr><td>roll N dice</td><td><code>d6(3)</code>, <code>d20(2)</code></td></tr>
+    <tr><td>a custom / weighted die</td><td><code>die([0,0,1,2])</code></td></tr>
+    <tr><td>mix dice</td><td><code>[d8, d6, d6]</code></td></tr>
+    <tr><td>add a modifier</td><td><code>d6(2).addBonus(3)</code></td></tr>
+    <tr><td>keep best / worst</td><td><code>.keepHigh(n)</code> / <code>.keepLow(n)</code></td></tr>
+    <tr><td>advantage / disadvantage</td><td><code>d20(2).keepHigh(1)</code> / <code>.keepLow(1)</code></td></tr>
+    <tr><td>chart the odds</td><td><code>display({ pool: … })</code></td></tr>
+    <tr><td>ask pass/fail</td><td><code>filter: roll => total(roll) >= 10</code></td></tr>
+    <tr><td>count successes</td><td><code>count(roll, v => v >= 5)</code></td></tr>
+    <tr><td>compare options</td><td><code>displayScaling({ pool: [ {label, pool}, … ] })</code></td></tr>
+    <tr><td>sweep a number</td><td><code>displayScaling({ pool: n => …, over: { from, to } })</code></td></tr>
+    <tr><td>chance within N tries</td><td><code>displayCumulative({ pool: …, over: { attempts: N } })</code></td></tr>
+    <tr><td>roll once</td><td><code>displayRoll({ pool: … })</code></td></tr>
+    <tr><td>add a slider</td><td><code>slider("name", { min, max, value })</code></td></tr>
+  </table>
+  <p>Now jump into the <a href="./">playground</a> and tweak an example.</p>
+</main>
+
+<footer>
+  DiceScript · <a href="./">playground</a> · <a href="https://github.com/pozz94/DiceProbabilityEngine">source</a> · MPL-2.0
+</footer>
+</body>
+</html>

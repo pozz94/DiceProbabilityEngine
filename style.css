@@ -86,8 +86,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 #topbar button.run:hover { opacity: 0.85; }
 #topbar button.example { background: transparent; color: var(--muted); border-left: 1px solid var(--border); }
 #topbar button.example:hover { color: var(--text); }
+/* the Docs link styled like the example buttons */
+#topbar a.example {
+  display: flex; align-items: center; height: 100%; padding: 0 1rem;
+  font-family: 'DM Mono', monospace; font-size: 0.72rem; font-weight: 500; letter-spacing: 0.06em;
+  text-decoration: none; background: transparent; color: var(--muted);
+  border-left: 1px solid var(--border); transition: opacity 0.12s;
+}
+#topbar a.example:hover { color: var(--text); }
 /* actions stay fully visible; the title clips before it can push them off-screen */
-#topbar button, #topbar .tag, #topbar .shortcut { flex-shrink: 0; }
+#topbar button, #topbar a.example, #topbar .tag, #topbar .shortcut { flex-shrink: 0; }
 #topbar .title { min-width: 0; overflow: hidden; }
 
 /* ── Mobile top bar ── */
@@ -96,7 +104,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   /* declutter: just the ⚄ logo, no Ctrl+Enter hint, no tag — room for the buttons */
   #topbar .shortcut, #topbar .tag, #topbar .title-text { display: none; }
   #topbar .title { font-size: 1.05rem; padding: 0 0.7rem; border-right: none; }
-  #topbar button { padding: 0 0.85rem; font-size: 0.78rem; }
+  #topbar button, #topbar a.example { padding: 0 0.85rem; font-size: 0.78rem; }
   /* menu: stack columns and scroll instead of overflowing sideways */
   #menu-inner { flex-direction: column; }
   #menu-inner .ex-col { border-right: none; border-bottom: 1px solid var(--border); }
@@ -104,7 +112,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   #menu-accordion.open { max-height: 70vh; overflow-y: auto; }
 }
 @media (max-width: 360px) {
-  #topbar button { padding: 0 0.6rem; font-size: 0.74rem; }   /* squeeze on tiny phones */
+  #topbar button, #topbar a.example { padding: 0 0.6rem; font-size: 0.74rem; }   /* squeeze on tiny phones */
+  #topbar #docs-btn { display: none; }   /* tightest screens: drop Docs link (still in menu/footer) */
 }
 
 /* ── Main layout ── */
