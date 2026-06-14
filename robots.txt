@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://pozz94.github.io/DiceProbabilityEngine/sitemap.xml
