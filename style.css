@@ -93,19 +93,18 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 /* ── Mobile top bar ── */
 @media (max-width: 600px) {
   :root { --topbar: 44px; }                 /* bigger touch targets */
-  #topbar .shortcut { display: none; }      /* Ctrl+Enter is meaningless on touch */
-  #topbar .title { font-size: 0.92rem; padding: 0 0.7rem; }
-  #topbar .tag { font-size: 0.55rem; padding: 0 0.55rem; }
-  #topbar button { padding: 0 0.95rem; font-size: 0.78rem; }
+  /* declutter: just the ⚄ logo, no Ctrl+Enter hint, no tag — room for the buttons */
+  #topbar .shortcut, #topbar .tag, #topbar .title-text { display: none; }
+  #topbar .title { font-size: 1.05rem; padding: 0 0.7rem; border-right: none; }
+  #topbar button { padding: 0 0.85rem; font-size: 0.78rem; }
   /* menu: stack columns and scroll instead of overflowing sideways */
   #menu-inner { flex-direction: column; }
   #menu-inner .ex-col { border-right: none; border-bottom: 1px solid var(--border); }
   #menu-inner .ex-col:last-child { border-bottom: none; }
   #menu-accordion.open { max-height: 70vh; overflow-y: auto; }
 }
-@media (max-width: 400px) {
-  #topbar .tag { display: none; }           /* drop branding when really tight */
-  #topbar button { padding: 0 0.75rem; }
+@media (max-width: 360px) {
+  #topbar button { padding: 0 0.6rem; font-size: 0.74rem; }   /* squeeze on tiny phones */
 }
 
 /* ── Main layout ── */
@@ -114,19 +113,6 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   display: grid; grid-template-columns: 1fr 1fr;
   overflow: hidden; transition: top 0.2s ease;
 }
-/* Mobile/narrow PORTRAIT: editor on top, output below — each half the height. */
-@media (max-width: 900px) and (orientation: portrait) {
-  #main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
-  #editor-pane { border-right: none; border-bottom: 1px solid var(--border); }
-}
-/* Touch + portrait: when the editor is focused (keyboard up), it takes the
-   whole screen so you can see what you type; output returns on blur. */
-@media (max-width: 900px) and (orientation: portrait) and (pointer: coarse) {
-  body.keyboard-open #main { grid-template-rows: 1fr; }
-  body.keyboard-open #output-pane { display: none; }
-}
-/* Mobile LANDSCAPE keeps the side-by-side split (each half the width) — the
-   default two-column layout already does this. */
 
 #editor-pane { border-right: 1px solid var(--border); overflow: hidden; height: 100%; }
 #monaco-container { width: 100%; height: 100%; }
@@ -194,3 +180,23 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .error-block { border: 1px solid var(--err); padding: 0.85rem; font-size: 0.75rem; color: var(--err); line-height: 1.6; animation: fadeIn 0.2s ease; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 200px; gap: 0.5rem; color: var(--muted); font-size: 0.75rem; }
 .empty-state .big { font-family: 'Instrument Serif', serif; font-style: italic; font-size: 3rem; color: var(--border); }
+
+/* ── Mobile/narrow PORTRAIT layout (after the base pane rules so it wins) ── */
+/* One scrolling page: the editor fills the top half (bottom edge on the
+   half-viewport line) and scrolls its own code; the output fills the bottom
+   half and, when scrolled, carries the whole editor container up out of view. */
+@media (max-width: 900px) and (orientation: portrait) {
+  #main { display: block; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  #editor-pane {
+    height: calc(50vh - var(--topbar));
+    border-right: none; border-bottom: 1px solid var(--border);
+  }
+  #output-pane { display: block; height: auto; min-height: 50vh; }
+  #output-scroll { flex: none; height: auto; overflow: visible; }  /* scroll with the page */
+}
+/* Touch + portrait: focusing the editor (keyboard up) grows it to full screen;
+   output stays below (reachable by scroll / on blur — no trap); split returns on blur. */
+@media (max-width: 900px) and (orientation: portrait) and (pointer: coarse) {
+  body.keyboard-open #editor-pane { height: calc(100vh - var(--topbar)); }
+}
+/* Mobile LANDSCAPE keeps the default two-column split (each half the width). */

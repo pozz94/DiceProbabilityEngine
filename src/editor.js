@@ -161,7 +161,7 @@ window._editor.onDidFocusEditorText(() => document.body.classList.add('keyboard-
 window._editor.onDidBlurEditorText(() => document.body.classList.remove('keyboard-open'));
 
 document.fonts.load('13px "DM Mono"').then(() => {
-  window._editor.remeasureFonts();
+  monaco.editor.remeasureFonts();   // namespace fn, re-measures all editors
 });
 
 // run once on load so the output is populated without pressing Run
