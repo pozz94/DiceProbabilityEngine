@@ -1,1181 +1,784 @@
 // ================================================================
-// ARCHITECTURE
+// dicescript — engine
 //
-// Everything is "WeightedOutcomes": an array of {dice: number[], prob: number}
-// where dice[] preserves the physical left-to-right roll order.
+// Pure, presentation-free, no global/prototype mutation on import.
+// Holds only primitives + the pure data functions.
 //
-// Pool is a lazy builder. pool._resolve(cutoff) returns WeightedOutcomes.
-//
-// pool[n]            → DieRef(n): a lazy reference to die n of this pool.
-// dieRef.isMax/isMin → DieCondition: a lazy condition for use in .when().
-// pool.when(cond, result)
-//   → ConditionalPool: for each concrete outcome, if cond fires resolve to
-//     result; otherwise pass the outcome through unchanged. Chain freely.
-// pool.discard()     → LazyDiscard sentinel: when used as a .when() result,
-//     marks the current outcome's dice as discarded.
-//
-// .morph(fn) is the lower-level escape hatch: iterates every concrete
-// outcome, calls fn(Kept), merges results back into WeightedOutcomes.
-//
-// resolveToOutcomes(x) is the single conversion function that turns
-// whatever the user returned (Kept, Pool, EmptyPool, number, null)
-// into a WeightedOutcomes array.
+// Implementation model (Engine spec §6): poolBuilder is an *effect
+// boundary*. We realise it by **re-executing** the builder body once
+// per joint assignment of the dice it reads. A global enumeration
+// context (CTX) feeds each atom its face from a trace; the first
+// atom not yet in the trace throws `FreshChoice`, and the enumerator
+// branches over its faces (weighted), extending the trace. Because a
+// resumption fixes every atom it touches, every read inside the body
+// returns a concrete value and `&&`/`>`/`when` operate on plain
+// booleans (§6, §7). Recursion (explosion, §8) is bounded by a
+// probability cutoff: an always-exploding branch's weight decays
+// geometrically and is pruned below EPSILON.
 // ================================================================
 
-export const EPSILON = 1e-9;
+export const EPSILON = 1e-12;
 
 // ----------------------------------------------------------------
-// DieType
+// §1 Dice — kinds and the `die(...)` constructor
 // ----------------------------------------------------------------
-export class DieType {
-  constructor(sides, name) {
-    this.sides = sides;
-    this.min = 1;
-    this.max = sides;
-    this.faces = Array.from({length: sides}, (_, i) => i + 1);
-    this.faceProb = 1 / sides;
-    this.pmf = new Map();
-    for (let i = 1; i <= sides; i++) this.pmf.set(i, this.faceProb);
-    this.name = name || `d${sides}`;
+
+let _leafSeq = 0;        // leaf identity (§2) — provenance, never value
+const nextLeafId = () => ++_leafSeq;
+
+// A DieKind is the *fifth* property (§4 `is`): value-independent face set.
+// Kind equality is face-multiset equality; name is irrelevant.
+export class DieKind {
+  constructor(faces, name) {
+    this.faces = [...faces];
+    this.name = name ?? null;
+    // distinct face -> probability, for weighting (repeated faces = weight, §1)
+    const m = new Map();
+    for (const f of this.faces) m.set(f, (m.get(f) || 0) + 1 / this.faces.length);
+    this.pmf = [...m.entries()].map(([face, prob]) => ({ face, prob }));
+    // bounds exist only for ordered-numeric faces (§4)
+    this.numeric = this.faces.every(f => typeof f === 'number');
+    this.min = this.numeric ? Math.min(...this.faces) : undefined;
+    this.max = this.numeric ? Math.max(...this.faces) : undefined;
+    // canonical multiset signature for kind equality
+    this._sig = JSON.stringify([...this.faces].sort((a, b) =>
+      a < b ? -1 : a > b ? 1 : 0));
+    // short interned id: kinds with identical face multisets share it, so it
+    // serves as a fast key for outcome-merge signatures (§ resolver).
+    this._id = _kindIds.get(this._sig) ?? (_kindIds.set(this._sig, ++_kindSeq), _kindSeq);
   }
-  toString() { return this.name; }
+  equals(other) { return other instanceof DieKind && this._sig === other._sig; }
+}
+let _kindSeq = 0;
+const _kindIds = new Map();   // _sig -> short id
+
+// `die(n, name?)` faces 1..n; `die([faces], name?)` explicit faces (§1).
+export function die(spec, name) {
+  const faces = Array.isArray(spec)
+    ? spec
+    : Array.from({ length: spec }, (_, i) => i + 1);
+  const kind = new DieKind(faces, name ?? (Array.isArray(spec) ? null : `d${spec}`));
+  return makePool(new LeafTemplate(kind));
 }
 
 // ----------------------------------------------------------------
-// Custom die factory
+// §3/§4 Per-die sentinels for shows(max|min)
 // ----------------------------------------------------------------
-export function customDie(faces, name) {
-  const type = new DieType(faces.length, name || `d[${faces.join(',')}]`);
-  type.faces = [...faces];
-  type.min = Math.min(...faces);
-  type.max = Math.max(...faces);
-  type.pmf = new Map();
-  for (const f of faces) type.pmf.set(f, (type.pmf.get(f) || 0) + 1/faces.length);
-  type.faceProb = 1 / faces.length;
-  return new Pool(type, 1);
-}
+export const max = Symbol('max');   // resolved against each die's own bounds
+export const min = Symbol('min');
 
 // ----------------------------------------------------------------
-// WeightedOutcomes helpers
+// Concrete resolved tree — produced inside a resumption.
+//   Leaf:  one atom (a die) with a rolled face and an active flag.
+//   Group: a provenance node (§2 node identity); may carry a label.
+// Leaves are shared mutable objects: a discard on a view flips the
+// shared atom's `active` flag and the parent sees it (§1 live views).
 // ----------------------------------------------------------------
-
-// Precomputed factorials for multinomial coefficients (up to 200!).
-const _fact = [1];
-for (let i = 1; i <= 200; i++) _fact[i] = _fact[i-1] * i;
-
-function rollPool(type, n) {
-  if (n === 0) return [{dice: [], prob: 1}];
-  const entries = type.pmf ? [...type.pmf.entries()] : type.faces.map(f => [f, type.faceProb]);
-  const F = entries.length;
-
-  // For uniform dice (all faces equally likely) or any dice with n > threshold,
-  // enumerate multisets instead of all ordered combinations.
-  // Multiset count = C(n+F-1, F-1) vs F^n — dramatically fewer for large n.
-  const multisetCount = _fact[n + F - 1] / (_fact[n] * _fact[F - 1]);
-  if (multisetCount < Math.pow(F, n)) {
-    const outcomes = [];
-    // counts[i] = how many dice show entries[i][0]
-    const counts = new Array(F).fill(0);
-    function rec(faceIdx, remaining) {
-      if (faceIdx === F - 1) {
-        counts[faceIdx] = remaining;
-        // multinomial probability: n! / (c0! * c1! * ... * cF-1!) * prod(p_i ^ c_i)
-        let prob = _fact[n];
-        let dice = [];
-        for (let i = 0; i < F; i++) {
-          prob *= Math.pow(entries[i][1], counts[i]) / _fact[counts[i]];
-          for (let j = 0; j < counts[i]; j++) dice.push(entries[i][0]);
-        }
-        outcomes.push({dice, prob});
-        counts[faceIdx] = 0;
-        return;
-      }
-      for (let c = 0; c <= remaining; c++) {
-        counts[faceIdx] = c;
-        rec(faceIdx + 1, remaining - c);
-      }
-      counts[faceIdx] = 0;
-    }
-    rec(0, n);
-    return outcomes;
+class Leaf {
+  constructor(kind, face) {
+    this.kind = kind;
+    this.name = kind.name;
+    this.id = nextLeafId();
+    this.face = face;
+    this.active = true;   // false => ghost (discarded, §10)
   }
-
-  // Fallback: full ordered enumeration (needed when keep-high/keep-low is applied,
-  // since those ops depend on which specific die rolled what).
-  const outcomes = [];
-  function recOrdered(depth, current, prob) {
-    if (depth === n) { outcomes.push({dice: [...current], prob}); return; }
-    for (const [f, p] of entries) { current.push(f); recOrdered(depth + 1, current, prob * p); current.pop(); }
-  }
-  recOrdered(0, [], 1);
-  return outcomes;
 }
-
-function keepHighDice(dice, n, dir) {
-  const indexed = dice.map((v, i) => [v, i]);
-  indexed.sort((a, b) => b[0] - a[0] || (a[1] - b[1]) * dir);
-  const keep = new Set(indexed.slice(0, n).map(([, i]) => i));
-  return dice.filter((_, i) => keep.has(i));
-}
-
-function keepLowDice(dice, n, dir) {
-  const indexed = dice.map((v, i) => [v, i]);
-  indexed.sort((a, b) => a[0] - b[0] || (a[1] - b[1]) * dir);
-  const keep = new Set(indexed.slice(0, n).map(([, i]) => i));
-  return dice.filter((_, i) => keep.has(i));
-}
-
-export function mergeGroups(a, b) {
-  if (!a && !b) return undefined;
-  const result = {...(a||{})};
-  for (const [k, v] of Object.entries(b||{})) result[k] = (result[k]||0) + v;
-  return result;
-}
-
-function mergeWeighted(parts) {
-  const result = [];
-  for (const {outcomes, weight} of parts) {
-    if (weight < EPSILON) continue;
-    for (const {dice, types, pools, groups, prob} of outcomes) {
-      result.push({dice, types, pools, groups, prob: prob * weight});
-    }
-  }
-  return result;
-}
-
-export function toPMF(outcomes) {
-  const pmf = new Map();
-  for (const {dice, prob} of outcomes) {
-    const s = dice.reduce((a, b) => a + b, 0);
-    pmf.set(s, (pmf.get(s) || 0) + prob);
-  }
-  return pmf;
-}
-
-export function groupContributions(outcomes) {
-  const sums = {};
-  for (const {prob, groups} of outcomes) {
-    if (!groups) continue;
-    for (const [name, val] of Object.entries(groups)) {
-      sums[name] = (sums[name] || 0) + val * prob;
-    }
-  }
-  return sums;
-}
-
-// ----------------------------------------------------------------
-// resolveToOutcomes
-// ----------------------------------------------------------------
-function resolveToOutcomes(value, type, cutoff) {
-  if (typeof value === 'function' && value.dice) {
-    const out = value._toOutcome ? value._toOutcome() : {dice: value.dice, types: value._types, prob: 1};
-    if (value._groups) out.groups = mergeGroups(value._groups, out.groups);
-    return [out];
-  }
-  if (value instanceof SelfRefPlaceholder) return [{dice: ['__SELFREF__'], prob: 1}];
-  if (value instanceof EmptyPool)          return [{dice: [], prob: 1}];
-  if (value instanceof DiscardedPool)      return value._resolve(cutoff);
-  if (value instanceof Pool)               return value._resolve(cutoff);
-  if (value === null || value === undefined) return [{dice: [], prob: 1}];
-  if (typeof value === 'number')           return [{dice: value === 0 ? [] : [value], prob: 1}];
-  if (Array.isArray(value))               return value;
-  return [{dice: [], prob: 1}];
-}
-
-function resolveAddIntent(intent, type, cutoff) {
-  if (_mode === 'roll') {
-    let allDice = [...intent.baseDice];
-    let allTypes = [...(intent.baseTypes||[])];
-    const basePools = intent._sourcePools ||
-      [{dice: intent.baseDice.map((v,i) => ({v, t:(intent.baseTypes||[])[i]||type, discarded:false}))}];
-    const extraPools = [];
-    for (const {pool, name} of (intent.additions||[])) {
-      const [out] = pool._resolve(cutoff);
-      allDice = [...allDice, ...out.dice];
-      allTypes = [...allTypes, ...(out.types||[])];
-      const entry = {};
-      if (name) entry.name = name;
-      const outPools = out.pools || [];
-      if (outPools.length >= 1) {
-        entry.dice = outPools[0].dice || out.dice.map((v,i)=>({v,t:(out.types||[])[i],discarded:false}));
-        if (outPools.length > 1) entry.pools = outPools.slice(1);
-      } else {
-        entry.dice = out.dice.map((v,i)=>({v,t:(out.types||[])[i],discarded:false}));
-      }
-      extraPools.push(entry);
-    }
-    return [{ dice: allDice, types: allTypes, pools: [...basePools, ...extraPools], prob: 1 }];
-  }
-  const SR = '__SELFREF__';
-  let results = [{ dice: [...intent.baseDice], types: [...intent.baseTypes], groups: intent._baseGroups, prob: 1 }];
-  for (const {pool: addPool, name: poolName} of (intent.additions||[])) {
-    const addedOutcomes = addPool._resolve(cutoff);
-    const next = [];
-    for (const {dice:d1, types:t1, groups:g1, prob:p1} of results) {
-      for (const {dice:d2, types:t2, groups:g2, prob:p2} of addedOutcomes) {
-        const hasSR = d2.includes(SR);
-        const bSum = hasSR ? 0 : d2.reduce((a,b) => a+b, 0);
-        const addedGroups = poolName ? {[poolName]: bSum, ...(g2||{})} : (g2||undefined);
-        next.push({
-          dice: [...d1, ...(hasSR ? [SR] : d2)],
-          types: [...t1, ...(hasSR ? [] : (t2||[]))],
-          groups: mergeGroups(g1, addedGroups),
-          prob: p1*p2
-        });
-      }
-    }
-    results = next;
-  }
-  return results;
-}
-
-// ----------------------------------------------------------------
-// Kept: what fn receives inside .morph(kept => ...)
-// ----------------------------------------------------------------
-function makeKept(dice, type, cutoff) {
-  const types = Array.isArray(type) ? type : dice.map(() => type);
-
-  function kept() { return kept; }
-  kept.dice = dice;
-  kept._types = types;
-  kept._cutoff = cutoff;
-  kept._toOutcome = () => ({
-    dice,
-    types,
-    pools: [{ dice: dice.map((v,i) => ({v, t:types[i], discarded:false})) }],
-    prob: 1
-  });
-
-  Object.defineProperty(kept, 'size',    { get: () => dice.length });
-  Object.defineProperty(kept, 'sum',     { get: () => dice.reduce((a, b) => a + b, 0) });
-  Object.defineProperty(kept, 'highest', { get: () => Math.max(...dice) });
-  Object.defineProperty(kept, 'lowest',  { get: () => Math.min(...dice) });
-
-  Object.defineProperty(kept, 'isMax', { get: () => types.reduce((p, t) => p * (1/t.sides), 1) });
-  Object.defineProperty(kept, 'isMin', { get: () => types.reduce((p, t) => p * (1/t.sides), 1) });
-
-  Object.defineProperty(kept, 'die', { get: () => {
-    const u = [...new Set(types.map(t => t.sides))];
-    if (u.length > 1) throw new Error(`Pool is mixed (${types.map(t=>'d'+t.sides).join(',')}) — use kept[i].die instead`);
-    return types[0];
-  }});
-
-  Object.defineProperty(kept, 'max', { get: () => {
-    _logs.push(`⚠ Warning: .max on a pool is ambiguous. Did you mean .isMax (probability) or .highest (concrete value)?`);
-    return undefined;
-  }});
-  Object.defineProperty(kept, 'min', { get: () => {
-    _logs.push(`⚠ Warning: .min on a pool is ambiguous. Did you mean .isMin (probability) or .lowest (concrete value)?`);
-    return undefined;
-  }});
-
-  Object.defineProperty(kept, 'leftmost',  { get: () => kept[0] });
-  Object.defineProperty(kept, 'rightmost', { get: () => kept[dice.length - 1] });
-
-  for (let i = 0; i < dice.length; i++) {
-    kept[i] = new BranchValue(dice[i], types[i], dice, cutoff);
-  }
-  kept[-1] = kept[dice.length - 1];
-
-  kept.at = (i) => kept[i];
-  kept.discard = () => new DiscardedPool(dice, types);
-  kept.addDice = (poolOrN, poolName) => {
-    if (typeof poolOrN === 'number' && poolOrN === 0) return kept;
-    if (Array.isArray(poolOrN)) return kept.addDice(coercePool(poolOrN), poolName);
-    const p = typeof poolOrN === 'function' ? new LazyPool(poolOrN, types[0])
-            : poolOrN instanceof LazyPool ? poolOrN
-            : poolOrN instanceof Pool ? new LazyPool(() => poolOrN, poolOrN.type)
-            : null;
-    if (!p) throw new Error('kept.addDice() expects a Pool, array of Pools, or function');
-    const ai = new AddIntent(dice, types, kept._groups);
-    ai.additions = [{pool: p, name: poolName||null}];
-    ai._sourcePools = kept._toOutcome ? kept._toOutcome().pools : null;
-    return ai;
-  };
-  kept.addBonus = (n, poolName) => n ? kept.addDice(customDie([n], `+${n}`), poolName || `+${n}`) : kept;
-  return kept;
-}
-
-// ----------------------------------------------------------------
-// DieRef / DieCondition — pool[n].isMax / pool[n].isMin
-// ----------------------------------------------------------------
-export class DieRef {
-  constructor(index) { this._index = index; }
-  get isMax() { return new DieCondition(this._index, 'max'); }
-  get isMin() { return new DieCondition(this._index, 'min'); }
-}
-
-export class DieCondition {
-  constructor(index, type) { this._index = index; this._type = type; }
-  test(dice, types) {
-    const i = this._index < 0 ? dice.length + this._index : this._index;
-    if (i < 0 || i >= dice.length) return false;
-    const t = Array.isArray(types) ? types[i] : types;
-    if (!t) return false;
-    return this._type === 'max' ? dice[i] === t.max : dice[i] === t.min;
+class Group {
+  constructor(children, label) {
+    this.children = children;   // Node[]
+    this.label = label ?? null; // node identity (provenance), or null
   }
 }
 
-// Sentinel returned by pool.discard() — ConditionalPool handles it specially.
-class LazyDiscard {}
+// A Factor is an independent sub-distribution folded in at resolution
+// (a nested poolBuilder, §5 disjoint provenance → product). It is opaque
+// to reads until expanded (§ resolver), so traversals skip it.
+class Factor { constructor(dist) { this.dist = dist; } }
 
-// ----------------------------------------------------------------
-// TaggedProb
-// ----------------------------------------------------------------
-class TaggedProb {
-  constructor(prob, face) { this.prob = prob; this.face = face; }
-  valueOf() { return this.prob; }
-  toString() { return String(this.prob); }
+const isLeaf = n => n instanceof Leaf;
+
+function activeLeaves(node, out = []) {
+  if (node instanceof Factor) return out;
+  if (isLeaf(node)) { if (node.active) out.push(node); return out; }
+  for (const c of node.children) activeLeaves(c, out);
+  return out;
+}
+function ghostLeaves(node, out = []) {
+  if (node instanceof Factor) return out;
+  if (isLeaf(node)) { if (!node.active) out.push(node); return out; }
+  for (const c of node.children) ghostLeaves(c, out);
+  return out;
+}
+// every leaf (active + ghost), skipping unexpanded factors
+function leavesOf(node, out = []) {
+  if (node instanceof Factor) return out;
+  if (isLeaf(node)) { out.push(node); return out; }
+  for (const c of node.children) leavesOf(c, out);
+  return out;
+}
+function collectFactors(node, out = []) {
+  if (node instanceof Factor) { out.push(node); return out; }
+  if (isLeaf(node)) return out;
+  for (const c of node.children) collectFactors(c, out);
+  return out;
+}
+// collect groups carrying `label` anywhere in the subtree (§4 label access)
+function labelledGroups(node, label, out = []) {
+  if (node instanceof Factor || isLeaf(node)) return out;
+  if (node.label === label) out.push(node);
+  for (const c of node.children) labelledGroups(c, label, out);
+  return out;
 }
 
 // ----------------------------------------------------------------
-// BranchValue
+// Enumeration context (the effect handler's runtime)
 // ----------------------------------------------------------------
-class BranchValue {
-  constructor(value, type, dice, cutoff) {
-    this._value = value; this._type = type; this._dice = dice; this._cutoff = cutoff;
-    this._parts = []; this._remaining = 1.0;
-    this.die = type;
-    this.isMax = new TaggedProb(1 / type.sides, type.max);
-    this.isMin = new TaggedProb(1 / type.sides, type.min);
-  }
+let CTX = null;
+class FreshChoice { constructor(kind) { this.kind = kind; } }
 
-  when(trigger, fnOrVal) {
-    if (this._remaining <= 0) return this;
-    if (typeof trigger === 'boolean') {
-      _logs.push(`⚠ Warning: .when() received a boolean. Did you mean .when(kept[i].isMax)?`);
-      return this;
-    }
-    let weight;
-    if (trigger instanceof TaggedProb) {
-      weight = (this._value === trigger.face) ? 1 : 0;
-    } else if (typeof trigger === 'number') {
-      weight = trigger === 0 ? 0 : Math.min(trigger, this._remaining);
-    } else {
-      weight = 0;
-    }
-    const effective = weight * this._remaining;
-    this._remaining -= effective;
-    if (effective > 0) this._parts.push({ fnOrVal, weight: effective });
-    return this;
+// An atom asks for its face. In 'enumerate' mode we serve it from the
+// trace or throw to branch; in 'sample' mode we draw it randomly.
+function atomFace(kind) {
+  if (CTX.mode === 'sample') {
+    const r = Math.random();
+    let cum = 0;
+    for (const { face, prob } of kind.pmf) { cum += prob; if (r < cum) return face; }
+    return kind.pmf[kind.pmf.length - 1].face;
   }
-
-  _resolveVal(fnOrVal) {
-    const result = fnOrVal === null             ? new EmptyPool()
-                 : typeof fnOrVal === 'function' ? fnOrVal()
-                 : fnOrVal;
-    return resolveToOutcomes(result, this._type, this._cutoff);
-  }
-
-  otherwise(fnOrVal) {
-    if (this._remaining > 0) this._parts.push({ fnOrVal, weight: this._remaining });
-    if (_mode === 'roll') {
-      const matched = this._parts.find(p => p.weight === 1) || this._parts[this._parts.length - 1];
-      return this._resolveVal(matched.fnOrVal);
-    }
-    const merged = [];
-    for (const { fnOrVal: v, weight: w } of this._parts) {
-      if (w <= 0) continue;
-      for (const { dice, types, allDice, groups, prob } of this._resolveVal(v))
-        merged.push({ dice, types, allDice, groups, prob: prob * w });
-    }
-    return merged;
-  }
+  const i = CTX.pointer++;
+  if (i < CTX.trace.length) return CTX.trace[i];
+  throw new FreshChoice(kind);          // first unassigned atom: branch here
 }
 
 // ----------------------------------------------------------------
-// Pool tree helpers
+// Instantiation — turn a template / view into a concrete node,
+// sampling fresh atoms via atomFace. Re-instantiating a *view* gives a
+// fresh pool of the same shape (kinds + labels), re-rolled — this is
+// what lets a nested poolBuilder explosion fold in a fresh sub-attack.
 // ----------------------------------------------------------------
-function flattenPools(pools) {
-  const result = [];
-  for (const pool of (pools || [])) {
-    for (const d of (pool.dice || [])) result.push(d);
-    if (pool.pools) result.push(...flattenPools(pool.pools));
-  }
-  return result;
+function instantiate(x) {
+  if (x instanceof Pool) return x._template._instantiate();
+  if (x instanceof PoolView) return reinstantiate(x._node);  // fresh, same shape
+  if (x instanceof Template) return x._instantiate();
+  if (Array.isArray(x)) return new Group(x.map(instantiate));
+  if (x == null) return new Group([]);
+  if (typeof x === 'number') return new Group([]); // bare 0-count etc.
+  throw new Error('cannot instantiate ' + typeof x);
+}
+function reinstantiate(node) {
+  if (isLeaf(node)) return new Leaf(node.kind, atomFace(node.kind));
+  // drop ghosts and already-resolved factors: not part of the shape forward
+  const kids = node.children
+    .filter(c => !(c instanceof Factor) && (isLeaf(c) ? c.active : true))
+    .map(reinstantiate);
+  return new Group(kids, node.label);
+}
+// structural shape key (kinds only, value-free) — used to memoize a
+// sub-builder's distribution across sibling outcomes (§8): the explosion
+// re-rolls fresh, so its distribution depends on shape, not rolled value.
+function shapeKey(node) {
+  if (node instanceof Factor) return '';
+  if (isLeaf(node)) return node.active ? 'L' + node.kind._sig : '';
+  return '(' + node.children.map(shapeKey).join(',') + ')';
 }
 
-function rebuildPools(pools, flat) {
-  let idx = 0;
-  function rebuild(pool) {
-    const newDice = (pool.dice || []).map(() => flat[idx++]);
-    const newSubPools = (pool.pools || []).map(rebuild);
-    const entry = {};
-    if (pool.name) entry.name = pool.name;
-    entry.dice = newDice;
-    if (newSubPools.length) entry.pools = newSubPools;
-    return entry;
+// ----------------------------------------------------------------
+// Templates — the lazy, value-free description the user composes.
+// ----------------------------------------------------------------
+class Template {
+  _instantiate() { throw new Error('abstract'); }
+  // a fresh concrete view; op-chains compose on the view so a selection
+  // (lowest/highest) carries through to a following discard (§1 live views)
+  _toView() { return new PoolView(this._instantiate()); }
+}
+class LeafTemplate extends Template {
+  constructor(kind, count = 1) { super(); this.kind = kind; this.count = count; }
+  _instantiate() {
+    const kids = Array.from({ length: this.count },
+      () => new Leaf(this.kind, atomFace(this.kind)));
+    return new Group(kids);
   }
-  return pools.map(rebuild);
+}
+class ArrayTemplate extends Template {
+  constructor(items) { super(); this.items = items; }
+  _instantiate() { return new Group(this.items.map(instantiate)); }
+}
+class BuilderTemplate extends Template {
+  constructor(fn, base, args) { super(); this.fn = fn; this.base = base; this.args = args; }
+  _instantiate() {
+    const view = new PoolView(instantiate(this.base));
+    const result = this.fn(view, ...this.args);
+    if (result instanceof PoolView) return result._root;
+    if (result instanceof Pool || result instanceof Template || Array.isArray(result))
+      return instantiate(result);
+    if (result == null) return new Group([]);
+    throw new Error('a poolBuilder body must return a pool');
+  }
+}
+class OpTemplate extends Template {       // a recorded view-op (addDice, discard…)
+  constructor(parent, op) { super(); this.parent = parent; this.op = op; }
+  _toView() { return this.op(this.parent._toView()); }   // op: view => view
+  _instantiate() { return this._toView()._root; }
+}
+
+// Structural active-leaf count (§4): how many dice are *present*, never
+// what they show. Computed by instantiating once in sample mode — the
+// count is deterministic for keep/discard/addDice even though faces are
+// random. (A value-dependent discard would make it sample-dependent,
+// which §4 documents as the caller's concern.)
+function structuralSize(x) {
+  if (typeof x === 'number') return x;
+  if (Array.isArray(x)) return x.reduce((a, it) => a + structuralSize(it), 0);
+  x = unwrap(x);
+  if (x instanceof PoolView) return x.size;
+  const prev = CTX;
+  CTX = { mode: 'sample' };
+  try { return activeLeaves(instantiate(x)).length; }
+  finally { CTX = prev; }
 }
 
 // ----------------------------------------------------------------
-// Pool
+// Reserved pool-member names (§4) — a label may not collide with one.
+// Closed, versioned vocabulary; collision throws at construction.
+// ----------------------------------------------------------------
+const RESERVED = new Set([
+  'size', 'shows', 'bounds', 'highest', 'lowest', 'sort', 'reduce',
+  'reduceDiscarded', 'is', 'discard', 'addDice', 'when',
+]);
+function checkLabel(label) {
+  if (label != null && RESERVED.has(label))
+    throw new Error(`label "${label}" collides with a reserved pool member`);
+  return label;
+}
+
+// ----------------------------------------------------------------
+// Pool — the user-facing template handle. Callable for poolsOf copies
+// (§1: die(6)(10)). Reads/ops on a template defer to a PoolView at
+// instantiation, so the same surface works at top level and in stdlib.
 // ----------------------------------------------------------------
 export class Pool {
-  constructor(type, n) {
-    this.type = type;
-    this._n = n;
-    this._ops = [];
-  }
+  constructor(template) { this._template = template; }
+  get size() { return structuralSize(this); }
 
-  get size() {
-    let s = this._n;
-    for (const {op, args} of this._ops) {
-      if (op === 'keepHigh' || op === 'keepLow') s = args[0];
-    }
-    return s;
+  addDice(arg, label) {
+    checkLabel(label);
+    return makePool(new OpTemplate(this._template, v => v.addDice(arg, label)));
   }
-
-  addDice(poolOrN, poolOrName, maybeName) {
-    // Conditional overload: addDice(DieCondition, pool, name?)
-    // Adds pool to the current concrete outcome only when condition fires.
-    if (poolOrN instanceof DieCondition) {
-      const aw = new AddWhenPool(this, poolOrN, coercePool(poolOrName));
-      if (maybeName) aw.poolName = maybeName;
-      return aw;
-    }
-    const poolName = poolOrName;
-    if (Array.isArray(poolOrN)) return this.addDice(coercePool(poolOrN), poolName);
-    if (typeof poolOrN === 'function') { const c = new ConcatPool(this, new LazyPool(poolOrN, this.type)); c.poolName = poolName||null; return c; }
-    if (poolOrN instanceof EmptyPool) return this;
-    if (poolOrN instanceof Pool) { const c = new ConcatPool(this, poolOrN); c.poolName = poolName||null; return c; }
-    if (typeof poolOrN === 'number') {
-      if (poolOrN === 0) return this;
-      if (poolName) {
-        const extra = new Pool(this.type, Math.round(poolOrN));
-        const c = new ConcatPool(this, extra);
-        c.poolName = poolName;
-        return c;
-      }
-      return new Pool(this.type, this._n + Math.round(poolOrN));
-    }
-    throw new Error('addDice expects a Pool, array of Pools, function, or number');
-  }
-
-  keepHigh(n, dir = 1) {
-    const self = this[UNWRAP] ?? this;
-    const p = Object.create(Object.getPrototypeOf(self));
-    Object.assign(p, self);
-    p._ops = [...(self._ops||[]), {op: 'keepHigh', args: [n, dir]}];
-    p._keepN = n;
-    return p;
-  }
-
-  keepLow(n, dir = 1) {
-    const self = this[UNWRAP] ?? this;
-    const p = Object.create(Object.getPrototypeOf(self));
-    Object.assign(p, self);
-    p._ops = [...(self._ops||[]), {op: 'keepLow', args: [n, dir]}];
-    p._keepN = n;
-    return p;
-  }
-
-  addBonus(n, poolName) {
-    if (!n) return this;
-    return this.addDice(customDie([n], `+${n}`), poolName || `+${n}`);
-  }
-
-  when(condition, result) {
-    if (result === undefined) return new ConditionalBuilder(this, condition);
-    return new ConditionalPool(this, condition, result);
-  }
-
-  discard() {
-    return new LazyDiscard();
-  }
-
-  morph(fn) {
-    return new ThenPool(this, fn);
-  }
-
-  _applyKeepOps(pools) {
-    if (!this._ops || !this._ops.some(o => o.op === 'keepHigh' || o.op === 'keepLow')) return pools;
-    let flat = flattenPools(pools);
-    for (const {op, args} of this._ops) {
-      if (op === 'keepHigh' || op === 'keepLow') {
-        const indexed = flat.map((d, i) => ({...d, i}));
-        indexed.sort(op === 'keepHigh'
-          ? (a, b) => b.v - a.v || (a.i - b.i) * (args[1]||1)
-          : (a, b) => a.v - b.v || (a.i - b.i) * (args[1]||1));
-        const keepIdx = new Set(indexed.slice(0, args[0]).map(x => x.i));
-        flat = flat.map((d, i) => ({...d, discarded: !keepIdx.has(i)}));
-      }
-    }
-    return rebuildPools(pools, flat);
-  }
-
-  _sample() {
-    const rolledDice = Array.from({length: this._n}, () => sampleDie(this.type));
-    const rolledTypes = Array.from({length: this._n}, () => this.type);
-    const pairs = rolledDice.map((v, i) => ({v, t: rolledTypes[i], discarded: false}));
-    const basePools = [{dice: pairs}];
-    const markedPools = this._applyKeepOps(basePools);
-    const flat = flattenPools(markedPools);
-    const kept = flat.filter(d => !d.discarded);
-    return [{
-      dice: kept.map(d => d.v),
-      types: kept.map(d => d.t),
-      pools: markedPools,
-      prob: 1
-    }];
-  }
-
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') return this._sample();
-    let outcomes = rollPool(this.type, this._n);
-    for (const {op, args} of this._ops) {
-      if (op === 'keepHigh') {
-        outcomes = outcomes.map(({dice, prob}) => ({dice: keepHighDice(dice, ...args), prob}));
-      } else if (op === 'keepLow') {
-        outcomes = outcomes.map(({dice, prob}) => ({dice: keepLowDice(dice, ...args), prob}));
-      }
-    }
-    return outcomes;
-  }
-
-  toPMF(cutoff = EPSILON) { return toPMF(this._resolve(cutoff)); }
+  lowest(n) { return makePool(new OpTemplate(this._template, v => v.lowest(n))); }
+  highest(n) { return makePool(new OpTemplate(this._template, v => v.highest(n))); }
+  sort(dir) { return makePool(new OpTemplate(this._template, v => v.sort(dir))); }
+  discard() { return makePool(new OpTemplate(this._template, v => v.discard())); }
 }
 
-// pool[0]..pool[15] and pool[-1] return DieRef(n) for use in .when() conditions.
-for (let i = 0; i < 16; i++) {
-  Object.defineProperty(Pool.prototype, String(i), {
-    get() { return new DieRef(i); }, configurable: true, enumerable: false,
-  });
-}
-Object.defineProperty(Pool.prototype, '-1', {
-  get() { return new DieRef(-1); }, configurable: true, enumerable: false,
-});
-
-// ----------------------------------------------------------------
-// Global mode + sampling
-// ----------------------------------------------------------------
-export let _mode = 'stats';
-export let _logs = [];
-export let _pendingKeys = new Map();
-export let _resolvedCache = new Map();
-export let _lazyPoolId = 0;
-
-export function resetEngineState() {
-  _mode = 'stats';
-  _pendingKeys.clear();
-  _resolvedCache.clear();
-  _lazyPoolId = 0;
-}
-
-function samplePMF(entries) {
-  const r = Math.random();
-  let cum = 0;
-  for (const [v, p] of entries) { cum += p; if (r < cum) return v; }
-  return entries[entries.length - 1][0];
-}
-
-function sampleDie(type) {
-  return samplePMF([...type.pmf.entries()]);
-}
-
-function poolStructureKey(pool) {
-  if (pool instanceof ConditionalPool) return `when(${poolStructureKey(pool._source)})`;
-  if (pool instanceof AddWhenPool)     return `addWhen(${poolStructureKey(pool._source)})`;
-  if (pool instanceof ThenPool)        return `morph(${poolStructureKey(pool._source)})`;
-  if (pool instanceof ConcatPool)      return `cat(${poolStructureKey(pool._a)},${poolStructureKey(pool._b)})`;
-  if (pool instanceof EmptyPool)       return `empty`;
-  if (pool instanceof LazyPool)        return `lazy`;
-  return `pool(d${pool.type.sides},n${pool._n},[${pool._ops.map(o=>o.op+o.args).join(',')}])`;
-}
-
-// ----------------------------------------------------------------
-// AddIntent
-// ----------------------------------------------------------------
-class AddIntent extends Pool {
-  constructor(baseDice, baseTypes, baseGroups) {
-    const type = (baseTypes && baseTypes[0]) || new DieType(6);
-    super(type, baseDice.length);
-    this.baseDice = baseDice;
-    this.baseTypes = baseTypes || [];
-    this.additions = [];
-    this._baseGroups = baseGroups || undefined;
-  }
-  _add(pool, name) {
-    const ai = new AddIntent(this.baseDice, this.baseTypes, this._baseGroups);
-    const lazy = pool instanceof LazyPool ? pool : new LazyPool(() => pool, pool.type);
-    ai.additions = [...this.additions, {pool: lazy, name: name||null}];
-    return ai;
-  }
-  addDice(poolOrN, poolName) {
-    const p = typeof poolOrN === 'function' ? new LazyPool(poolOrN, this.type)
-            : poolOrN instanceof Pool ? poolOrN
-            : customDie([poolOrN]);
-    return this._add(p, poolName);
-  }
-  addBonus(n, name) { return n ? this.addDice(customDie([n], `+${n}`), name||`+${n}`) : this; }
-  _resolve(cutoff = EPSILON) { return resolveAddIntent(this, this.type, cutoff); }
-  toPMF(cutoff = EPSILON) { return toPMF(this._resolve(cutoff)); }
-}
-
-// ----------------------------------------------------------------
-// LazyPool
-// ----------------------------------------------------------------
-class LazyPool extends Pool {
-  constructor(fn, type) {
-    super(type || new DieType(6), 0);
-    this._fn = fn;
-    this._cache = null;
-    this._id = ++_lazyPoolId;
-  }
-  _materialize() {
-    if (!this._cache) this._cache = this._fn();
-    return this._cache;
-  }
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') return this._materialize()._resolve(cutoff);
-    const structKey = poolStructureKey(this._materialize());
-    if (_pendingKeys.has(structKey)) return _pendingKeys.get(structKey)._resolve();
-    const placeholder = new SelfRefPlaceholder(this.type);
-    _pendingKeys.set(structKey, placeholder);
-    const raw = this._materialize()._resolve(cutoff);
-    _pendingKeys.delete(structKey);
-    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
-    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
-  }
-  get size() { return this._materialize().size; }
-  addDice(x, y, z) { return this._materialize().addDice(x, y, z); }
-  keepHigh(n, dir=1) { return this._materialize().keepHigh(n, dir); }
-  keepLow(n, dir=1) { return this._materialize().keepLow(n, dir); }
-  morph(fn) { return this._materialize().morph(fn); }
-}
-
-// ----------------------------------------------------------------
-// ConditionalPool — pool.when(condition, result)
-// For each concrete outcome: if condition fires, resolve to result;
-// otherwise pass the outcome through unchanged.
-// ----------------------------------------------------------------
-class ConditionalPool extends Pool {
-  constructor(source, condition, result) {
-    super(source.type, source.size);
-    this._source = source;
-    this._condition = condition;
-    this._result = result;
-  }
-
-  _test(dice, types) {
-    const c = this._condition;
-    if (c instanceof DieCondition) return c.test(dice, types);
-    if (typeof c === 'function')   return c(dice, types);
-    return false;
-  }
-
-  _applyResult(dice, types, srcPools, cutoff) {
-    if (this._result instanceof LazyDiscard) {
-      if (_mode === 'roll') {
-        return [{
-          dice:  [],
-          types: [],
-          pools: [{dice: dice.map((v, i) => ({v, t: types[i], discarded: true}))}],
-          prob:  1,
-        }];
-      }
-      return [{dice: [], prob: 1}];
-    }
-    return resolveToOutcomes(this._result, this.type, cutoff);
-  }
-
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') {
-      const [{dice, types, pools: srcPools}] = this._source._resolve();
-      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
-      if (this._test(dice, eff)) return this._applyResult(dice, eff, srcPools, cutoff);
-      return [{dice, types: eff, pools: srcPools, prob: 1}];
-    }
-
-    const parts = [];
-    for (const {dice, types, pools: srcPools, prob, groups} of this._source._resolve(cutoff)) {
-      if (prob < EPSILON) continue;
-      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
-      const resolved = this._test(dice, eff)
-        ? this._applyResult(dice, eff, srcPools, cutoff)
-        : [{dice, types: eff, pools: srcPools, groups, prob: 1}];
-      parts.push({outcomes: resolved, weight: prob});
-    }
-    const raw = mergeWeighted(parts);
-    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
-    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
-  }
-}
-
-// ----------------------------------------------------------------
-// AddWhenPool — pool.addWhen(condition, extra)
-// Adds the extra pool's dice ON TOP of the current concrete outcome
-// when condition fires, rather than replacing the outcome.
-// ----------------------------------------------------------------
-class AddWhenPool extends Pool {
-  constructor(source, condition, extra) {
-    super(source.type, source.size);
-    this._source = source;
-    this._condition = condition;
-    this._extra = extra;
-  }
-
-  _test(dice, types) {
-    const c = this._condition;
-    if (c instanceof DieCondition) return c.test(dice, types);
-    if (typeof c === 'function')   return c(dice, types);
-    return false;
-  }
-
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') {
-      const [{dice, types, pools: srcPools}] = this._source._resolve();
-      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
-      if (!this._test(dice, eff)) return [{dice, types: eff, pools: srcPools, prob: 1}];
-      const [{dice: xd, types: xt, pools: xPools}] = resolveToOutcomes(this._extra, this.type, cutoff);
-      let newPools;
-      if (this.poolName) {
-        const entry = {name: this.poolName};
-        if (xPools && xPools.length) { entry.dice = xPools[0].dice || []; if (xPools.length > 1) entry.pools = xPools.slice(1); }
-        newPools = [...(srcPools||[]), entry];
-      } else {
-        newPools = [...(srcPools||[]), ...(xPools||[])];
-      }
-      return [{dice: [...dice, ...xd], types: [...eff, ...(Array.isArray(xt) ? xt : xd.map(() => this.type))], pools: newPools, prob: 1}];
-    }
-
-    const parts = [];
-    for (const {dice, types, pools: srcPools, prob, groups} of this._source._resolve(cutoff)) {
-      if (prob < EPSILON) continue;
-      const eff = Array.isArray(types) ? types : dice.map(() => this.type);
-      if (!this._test(dice, eff)) {
-        parts.push({outcomes: [{dice, types: eff, pools: srcPools, groups, prob: 1}], weight: prob});
-        continue;
-      }
-      const xOutcomes = resolveToOutcomes(this._extra, this.type, cutoff);
-      const combined = xOutcomes.map(({dice: xd, types: xt, prob: xp, groups: xg}) => ({
-        dice:   [...dice, ...xd],
-        types:  [...eff, ...(Array.isArray(xt) ? xt : xd.map(() => this.type))],
-        prob:   xp,
-        groups: (groups || xg) ? {...(groups||{}), ...(xg||{})} : undefined,
-      }));
-      parts.push({outcomes: combined, weight: prob});
-    }
-    const raw = mergeWeighted(parts);
-    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
-    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
-  }
-}
-
-// ----------------------------------------------------------------
-// ThenPool
-// ----------------------------------------------------------------
-class ThenPool extends Pool {
-  constructor(source, fn) {
-    super(source.type, source.size);
-    this._source = source;
-    this._fn = fn;
-  }
-
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') {
-      const [{dice, types, pools}] = this._source._resolve();
-      const kept = makeKept(dice, types || dice.map(() => this.type), cutoff);
-      if (pools && pools.length) kept._toOutcome = () => ({dice, types, pools, prob: 1});
-      const result = this._fn(kept);
-      return resolveToOutcomes(result, this.type, cutoff);
-    }
-    const sourceOutcomes = this._source._resolve(cutoff);
-    const parts = [];
-    for (const {dice, prob, groups: sourceGroups} of sourceOutcomes) {
-      if (prob < EPSILON) continue;
-      const kept = makeKept(dice, this.type, cutoff);
-      kept._groups = sourceGroups;
-      const result = this._fn(kept);
-      const resolved = resolveToOutcomes(result, this.type, cutoff);
-      parts.push({outcomes: resolved, weight: prob});
-    }
-    const raw = mergeWeighted(parts);
-    const hasSelfRef = raw.some(({dice}) => dice.includes('__SELFREF__'));
-    return hasSelfRef ? fixPointWithGroups(raw, this.type) : raw;
-  }
-}
-
-// ----------------------------------------------------------------
-// ConcatPool
-// ----------------------------------------------------------------
-class ConcatPool extends Pool {
-  constructor(a, b) {
-    super(a.type, 0);
-    this._a = a;
-    this._b = b;
-  }
-  get size() { return this._a.size + this._b.size; }
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') {
-      const [a] = this._a._resolve();
-      const [b] = this._b._resolve();
-      const bPools = b.pools || [];
-      let newPools;
-      if (this.poolName) {
-        const entry = { name: this.poolName };
-        if (bPools.length >= 1) {
-          entry.dice = bPools[0].dice || [];
-          if (bPools.length > 1) entry.pools = bPools.slice(1);
-        }
-        newPools = [...(a.pools||[]), entry];
-      } else {
-        newPools = [...(a.pools||[]), ...bPools];
-      }
-      if (this._ops && this._ops.length) newPools = this._applyKeepOps(newPools);
-      const flat = flattenPools(newPools);
-      const kept = flat.filter(d => !d.discarded);
-      return [{
-        dice: kept.map(d => d.v),
-        types: kept.map(d => d.t),
-        pools: newPools,
-        prob: 1
-      }];
-    }
-    const aOut = this._a._resolve(cutoff);
-    const bOut = this._b._resolve(cutoff);
-    const result = [];
-    for (const {dice: da, prob: pa, groups: ga} of aOut) {
-      for (const {dice: db, prob: pb, groups: gb} of bOut) {
-        const groups = {...(ga||{}), ...(gb||{})};
-        if (this.poolName) {
-          const bSum = db.reduce((a,b) => a+b, 0);
-          groups[this.poolName] = (groups[this.poolName] || 0) + bSum;
-        }
-        result.push({
-          dice: [...da, ...db],
-          prob: pa * pb,
-          groups: Object.keys(groups).length ? groups : undefined
-        });
-      }
-    }
-    return result;
-  }
-}
-
-// ----------------------------------------------------------------
-// Special pool types
-// ----------------------------------------------------------------
-class EmptyPool extends Pool {
-  constructor() { super(new DieType(6), 0); }
-  _resolve() { return [{dice: [], prob: 1}]; }
-}
-
-class DiscardedPool extends Pool {
-  constructor(dice, types) {
-    super((types&&types[0]) || new DieType(6), 0);
-    this._dice = dice;
-    this._types = types || [];
-  }
-  _resolve(cutoff = EPSILON) {
-    if (_mode === 'roll') {
-      return [{
-        dice: [],
-        types: [],
-        pools: [{ dice: this._dice.map((v, i) => ({v, t: this._types[i], discarded: true})) }],
-        prob: 1
-      }];
-    }
-    return [{dice: [], prob: 1}];
-  }
-}
-
-class SelfRefPlaceholder extends Pool {
-  constructor(type) { super(type || new DieType(6), 0); }
-  _resolve() { return [{dice: ['__SELFREF__'], prob: 1}]; }
-}
-
-// ----------------------------------------------------------------
-// ConditionalBuilder — returned by pool.when(cond) (single-arg form)
-// Captures a condition then applies the next chained operation:
-//   false/null/undefined  → skip (return pool unchanged)
-//   DieCondition          → runtime conditional via AddWhenPool or ConditionalPool
-//   other truthy          → apply unconditionally
-// ----------------------------------------------------------------
-class ConditionalBuilder {
-  constructor(pool, cond) {
-    this._pool = pool;
-    this._cond = cond;
-  }
-
-  _isFalsy() { return this._cond === false || this._cond === null || this._cond === undefined; }
-
-  keepHigh(n) {
-    if (this._isFalsy()) return this._pool;
-    return this._pool.keepHigh(n);
-  }
-
-  keepLow(n) {
-    if (this._isFalsy()) return this._pool;
-    return this._pool.keepLow(n);
-  }
-
-  addDice(extra, name) {
-    if (this._isFalsy()) return this._pool;
-    if (this._cond instanceof DieCondition) return this._pool.addDice(this._cond, extra, name);
-    return this._pool.addDice(extra, name);
-  }
-
-  addBonus(n, name) {
-    if (this._isFalsy()) return this._pool;
-    if (this._cond instanceof DieCondition)
-      return this._pool.addDice(this._cond, new Pool(this._pool.type, 0).addBonus(n, name));
-    return this._pool.addBonus(n, name);
-  }
-
-  discard() {
-    if (this._isFalsy()) return this._pool;
-    if (this._cond instanceof DieCondition) return this._pool.when(this._cond, this._pool.discard());
-    return this._pool.when(() => true, this._pool.discard());
-  }
-
-  when(cond, result) {
-    if (result !== undefined) {
-      if (this._isFalsy()) return this._pool;
-      return this._pool.when(cond, result);
-    }
-    // Single-arg chaining: combine conditions
-    if (this._isFalsy() || cond === false || cond === null || cond === undefined)
-      return new ConditionalBuilder(this._pool, false);
-    if (this._cond instanceof DieCondition) return new ConditionalBuilder(this._pool, this._cond);
-    if (cond instanceof DieCondition)       return new ConditionalBuilder(this._pool, cond);
-    return new ConditionalBuilder(this._pool, true);
-  }
-}
-
-// ----------------------------------------------------------------
-// PMF arithmetic for fixPoint
-// ----------------------------------------------------------------
-function convolvePMF(a, b) {
-  const out = new Map();
-  for (const [va, pa] of a)
-    for (const [vb, pb] of b)
-      out.set(va + vb, (out.get(va + vb) || 0) + pa * pb);
-  return out;
-}
-
-function addPMF(a, b) {
-  const out = new Map(a);
-  for (const [v, p] of b) out.set(v, (out.get(v) || 0) + p);
-  return out;
-}
-
-// Solve X = A + B⊛X via geometric series (for recursive pool expressions)
-function fixPoint(outcomes) {
-  const normalOutcomes = [];
-  const selfrefOutcomes = [];
-  for (const {dice, prob} of outcomes) {
-    const selfrefIdx = dice.indexOf('__SELFREF__');
-    if (selfrefIdx === -1) {
-      normalOutcomes.push({dice, prob});
-    } else {
-      const baseDice = dice.filter((_, i) => i !== selfrefIdx);
-      selfrefOutcomes.push({baseDice, prob});
-    }
-  }
-  if (selfrefOutcomes.length === 0) return toPMF(normalOutcomes);
-  let A = toPMF(normalOutcomes);
-  let B = new Map();
-  let totalSelfRefProb = 0;
-  for (const {baseDice, prob} of selfrefOutcomes) {
-    const s = baseDice.reduce((a, b) => a + b, 0);
-    B.set(s, (B.get(s) || 0) + prob);
-    totalSelfRefProb += prob;
-  }
-  let X = new Map();
-  let Bk = new Map([[0, 1]]);
-  let power = 1;
-  for (let k = 0; k < 200; k++) {
-    if (power < 1e-15) break;
-    X = addPMF(X, convolvePMF(Bk, A));
-    Bk = convolvePMF(Bk, B);
-    power *= totalSelfRefProb;
-  }
-  return X;
-}
-
-function fixPointWithGroups(raw, type) {
-  const pmf = fixPoint(raw);
-  const gs = {};
-  let totalSRProb = 0;
-  for (const {dice, prob, groups} of raw) {
-    if (dice.includes('__SELFREF__')) { totalSRProb += prob; continue; }
-    if (!groups) continue;
-    for (const [k, v] of Object.entries(groups)) gs[k] = (gs[k]||0) + v * prob;
-  }
-  const scale = totalSRProb < 1 ? 1 / (1 - totalSRProb) : 1;
-  const hasGroups = Object.keys(gs).length > 0;
-  const scaledGs = hasGroups ? Object.fromEntries(Object.entries(gs).map(([k,v]) => [k, v * scale])) : undefined;
-  return [...pmf.entries()].map(([v, p]) => ({
-    dice: v === 0 ? [] : [v],
-    prob: p,
-    groups: scaledGs
-  }));
-}
-
-// ----------------------------------------------------------------
-// Public API
-// ----------------------------------------------------------------
-// Wrap a Pool so it can also be called as a function:
-//   d6(3)  →  3 dice of the same type  (i.e. d6.addDice(2))
-// The Proxy target must itself be a function for the apply trap to fire.
-const UNWRAP = Symbol('callablePool.unwrap');
-
-function callablePool(p) {
-  const fn = function(n = 1) {
-    return n === 1 ? p : p.addDice(n - 1);
+// callable proxy: die(6)(10) => 10 copies of the kind (§1 poolsOf)
+function makePool(template) {
+  const p = new Pool(template);
+  const fn = function (n = 1) {
+    if (template instanceof LeafTemplate)
+      return makePool(new LeafTemplate(template.kind, template.count * n));
+    // generic poolsOf: n copies of this template
+    return makePool(new ArrayTemplate(Array.from({ length: n }, () => template)));
   };
   return new Proxy(fn, {
-    apply(_target, _thisArg, args) { return fn(...args); },
-    get(_target, prop, _receiver)  { return prop === UNWRAP ? p : Reflect.get(p, prop, p); },
-    has(_target, prop)             { return prop in p; },
-    getPrototypeOf()               { return Object.getPrototypeOf(p); },
+    apply: (_t, _this, args) => fn(...args),
+    get: (_t, prop) => prop === '__pool__' ? p : Reflect.get(p, prop, p),
+    has: (_t, prop) => prop in p,
+    getPrototypeOf: () => Pool.prototype,
   });
 }
-
-export function die(sides, name) {
-  return callablePool(new Pool(new DieType(sides, name), 1));
-}
+const unwrap = x => (x && x.__pool__) ? x.__pool__ : x;
 
 export function pool(x, n) {
-  if (Array.isArray(x)) {
-    if (x.length === 0) return new EmptyPool();
-    return x.map(p => pool(p)).reduce((acc, p) => new ConcatPool(acc, p));
-  }
-  // Unwrap CallablePool proxies to get the underlying Pool instance.
-  if (x && x[UNWRAP]) return x[UNWRAP];
-  if (x instanceof Pool) return x;
-  if (x instanceof DieType) return new Pool(x, n || 1);
-  if (!x) return new EmptyPool();
-  return new EmptyPool();
+  x = unwrap(x);
+  if (x instanceof Pool) return n && n > 1 ? x(n) : x;
+  if (Array.isArray(x)) return makePool(new ArrayTemplate(x.map(pool)));
+  if (x instanceof PoolView) return x;
+  if (x instanceof DieKind) return makePool(new LeafTemplate(x, n || 1));
+  if (x == null) return makePool(new ArrayTemplate([]));
+  return x;
 }
-
 export const coercePool = pool;
 
+// ----------------------------------------------------------------
+// PoolView — a concrete pool *inside a resumption*: every read returns
+// a value, every condition is a boolean. Also the value handed to
+// predicates (classify/filter) and to roll output. A sub-pool is a
+// live view sharing the parent's atoms (§1).
+// ----------------------------------------------------------------
+export class PoolView {
+  // _node: the node this view addresses; _root: the whole pool's root.
+  constructor(node, root) {
+    this._node = node;
+    this._root = root ?? node;
+  }
+
+  // --- structural reads (§4) ---
+  get size() { return activeLeaves(this._node).length; }
+
+  get bounds() {
+    const ls = activeLeaves(this._node);
+    if (!ls.every(l => l.kind.numeric))
+      throw new Error('bounds requires ordered-numeric dice');
+    const lo = ls.reduce((a, l) => a + l.kind.min, 0);
+    const hi = ls.reduce((a, l) => a + l.kind.max, 0);
+    return { min: lo, max: hi, span: hi - lo };
+  }
+
+  is(kindSpec) {
+    const ls = activeLeaves(this._node);
+    const want = (Array.isArray(kindSpec) ? kindSpec : null);
+    if (want) {
+      if (want.length !== ls.length) return false;
+      const have = ls.map(l => l.kind);
+      const pool = [...have];
+      for (const k of want.map(kindOf)) {
+        const i = pool.findIndex(h => h.equals(k));
+        if (i < 0) return false;
+        pool.splice(i, 1);
+      }
+      return true;
+    }
+    const k = kindOf(kindSpec);
+    return ls.every(l => l.kind.equals(k));
+  }
+
+  // --- outcome reads (§4) ---
+  reduce(reducer, seed) {
+    if (typeof reducer !== 'function') throw new Error('reduce requires a reducer');
+    return activeLeaves(this._node).reduce((acc, l) => reducer(acc, l.face), seed);
+  }
+  reduceDiscarded(reducer, seed) {
+    return ghostLeaves(this._node).reduce((acc, l) => reducer(acc, l.face), seed);
+  }
+
+  shows(spec) {
+    const ls = activeLeaves(this._node);
+    if (ls.length === 0) return false;
+    const test = Array.isArray(spec)
+      ? (l) => spec.some(s => faceMatches(l, s))
+      : (l) => faceMatches(l, spec);
+    return ls.every(test);
+  }
+
+  highest(n) { return this._rank(n, true); }
+  lowest(n) { return this._rank(n, false); }
+  _rank(n, high) {
+    const ls = activeLeaves(this._node).slice()
+      .sort((a, b) => high ? b.face - a.face : a.face - b.face);
+    return new PoolView(new Group(ls.slice(0, n)), this._root);
+  }
+  sort(dir = 'asc') {
+    const ls = activeLeaves(this._node).slice()
+      .sort((a, b) => dir === 'desc' ? b.face - a.face : a.face - b.face);
+    return new PoolView(new Group(ls), this._root);
+  }
+
+  // --- selection (§4) ---
+  at(i) {
+    const ls = activeLeaves(this._node);
+    const idx = i < 0 ? ls.length + i : i;
+    const leaf = ls[idx];
+    return new PoolView(new Group(leaf ? [leaf] : []), this._root);
+  }
+  label(name) {
+    const groups = labelledGroups(this._root, name);
+    const leaves = [];
+    for (const g of groups) activeLeaves(g, leaves);
+    return new PoolView(new Group(leaves), this._root);
+  }
+
+  // --- transforms ---
+  addDice(arg, label) {
+    checkLabel(label);
+    if (typeof arg === 'number') {
+      if (arg === 0) return this;
+      // N more dice of the pool's prevailing kind
+      const k = activeLeaves(this._node)[0]?.kind ?? new DieKind([0]);
+      arg = makePool(new LeafTemplate(k, arg));
+    }
+    const u = unwrap(arg);
+    let added;
+    // A nested poolBuilder is an independent sub-pool (§5 disjoint
+    // provenance → product). During enumeration, fold it in as a Factor
+    // (its own memoized distribution, convolved later) instead of inlining
+    // its atoms — that is what keeps recursion from blowing up (§8).
+    if (CTX && CTX.mode === 'enumerate' && u instanceof Pool && u._template instanceof BuilderTemplate) {
+      added = new Factor(resolveDist(u, CTX.weight * CTX.scale));
+    } else {
+      added = instantiate(arg);
+    }
+    if (label != null) added = new Group([added], label);
+    const newRoot = new Group([...childrenOf(this._root), added]);
+    return new PoolView(newRoot, newRoot);
+  }
+
+  // §10 nullary; removes the receiver's active dice, returns the root.
+  discard() {
+    for (const l of activeLeaves(this._node)) l.active = false;
+    return new PoolView(this._root, this._root);
+  }
+
+  // §7 when(cond, transform) ≡ cond ? transform(pool) : pool
+  when(cond, transform) {
+    return cond ? transform(this) : this;
+  }
+}
+
+// positional access (§4): p[0] is the sub-pool of the first active die,
+// p[-1] the last — the bracket spellings of .at(i). Negative indexes count
+// from the end. Defined as non-enumerable getters so they don't leak.
+for (let i = 0; i < 64; i++)
+  Object.defineProperty(PoolView.prototype, String(i), {
+    get() { return this.at(i); }, configurable: true, enumerable: false,
+  });
+for (const i of [-1, -2, -3])
+  Object.defineProperty(PoolView.prototype, String(i), {
+    get() { return this.at(i); }, configurable: true, enumerable: false,
+  });
+
+function childrenOf(node) { return isLeaf(node) ? [node] : node.children; }
+
+function kindOf(x) {
+  x = unwrap(x);
+  if (x instanceof DieKind) return x;
+  if (x instanceof Pool && x._template instanceof LeafTemplate) return x._template.kind;
+  if (x instanceof PoolView) return activeLeaves(x._node)[0]?.kind;
+  throw new Error('expected a die kind');
+}
+function faceMatches(leaf, spec) {
+  if (spec === max) return leaf.kind.numeric && leaf.face === leaf.kind.max;
+  if (spec === min) return leaf.kind.numeric && leaf.face === leaf.kind.min;
+  return leaf.face === spec;
+}
+
+// ----------------------------------------------------------------
+// §6 poolBuilder — the effect boundary.
+// ----------------------------------------------------------------
 export function poolBuilder(fn) {
-  return function(base, ...rest) {
-    const p = pool(base);
-    return new LazyPool(() => fn(p, ...rest));
-  };
+  return (base, ...args) => makePool(new BuilderTemplate(fn, base, args));
 }
 
-function defaultKey(args) {
-  return args.map(a =>
-    a instanceof Pool ? `pool(${a.type.sides},${a._n})` :
-    typeof a === 'function' ? 'fn' :
-    String(a)
-  ).join('|');
-}
+// ----------------------------------------------------------------
+// Resolution — re-execute the body once per joint assignment of the
+// atoms it *reads* (§6, branching on the first fresh atom), then merge
+// outcomes by face-multiset signature and convolve independent factors.
+// Merging collapses permutations (so reads, all symmetric, are stable)
+// and keeps each recursion level polynomial; the memo shares a recursive
+// sub-builder's distribution across sibling outcomes (§8); `scale` is the
+// absolute weight budget that bounds recursion depth.
+// ----------------------------------------------------------------
 
-export function memoize(fn, keyFn) {
-  const cache = new Map();
-  return function(...args) {
-    const key = keyFn ? keyFn(...args) : defaultKey(args);
-    if (cache.has(key)) return cache.get(key);
-    const result = fn(...args);
-    cache.set(key, result);
-    return result;
-  };
+// A distribution outcome is FLAT and value-free: the active/ghost Leaf arrays
+// plus precomputed *sorted key arrays* (_a/_g) — the kind+face multiset every
+// symmetric read depends on (total/count/shows/maxed/bounds/is). Carrying the
+// sorted keys lets convolve merge them in O(n) and lets mergeDist key off a
+// join without re-walking a tree; the Group is built only for final outcomes.
+function leafKey(l) { return l.kind._id + ':' + l.face; }
+const EMPTY = [];
+function mergeSorted(x, y) {
+  if (!x.length) return y;
+  if (!y.length) return x;
+  const out = new Array(x.length + y.length);
+  let i = 0, j = 0, k = 0;
+  while (i < x.length && j < y.length) out[k++] = x[i] <= y[j] ? x[i++] : y[j++];
+  while (i < x.length) out[k++] = x[i++];
+  while (j < y.length) out[k++] = y[j++];
+  return out;
 }
-
-export function pmfStats(pmf) {
-  const sorted = [...pmf.entries()].sort((a, b) => a[0] - b[0]);
-  let mean = 0, tot = 0;
-  for (const [v, p] of sorted) { mean += v * p; tot += p; }
-  mean /= tot;
-  let variance = 0;
-  for (const [v, p] of sorted) variance += p * (v - mean) ** 2;
-  let cum = 0, median = sorted[0][0], mode = sorted[0][0], modeP = 0, firstMedian = true;
-  for (const [v, p] of sorted) {
-    cum += p;
-    if (p > modeP) { modeP = p; mode = v; }
-    if (firstMedian && cum >= 0.5 - 1e-9) { median = v; firstMedian = false; }
-  }
-  function pct(q) {
-    let c = 0;
-    for (const [v, p] of sorted) { c += p; if (c >= q - 1e-9) return v; }
-    return sorted[sorted.length - 1][0];
-  }
+function flatten(root) {           // active + ghost leaves of a tree (skip factors)
+  const a = [], g = [];
+  (function rec(n) {
+    if (n instanceof Factor) return;
+    if (isLeaf(n)) { (n.active ? a : g).push(n); return; }
+    for (const c of n.children) rec(c);
+  })(root);
+  return { a, g };
+}
+function mkFlat(aLeaves, gLeaves, prob) {
   return {
-    mean, median, mode, stddev: Math.sqrt(variance),
-    min: sorted[0][0], max: sorted[sorted.length - 1][0],
-    p10: pct(0.1), p25: pct(0.25), p75: pct(0.75), p90: pct(0.9),
-    sorted
+    aLeaves, gLeaves, prob,
+    _a: aLeaves.length ? aLeaves.map(leafKey).sort() : EMPTY,
+    _g: gLeaves.length ? gLeaves.map(leafKey).sort() : EMPTY,
+  };
+}
+const sigOf = o => o._g.length ? o._a.join(',') + '||' + o._g.join(',') : o._a.join(',');
+
+// Resolution cutoff: branches/outcomes below this absolute probability are
+// pruned. The default is exact-ish; a renderer that only needs a few
+// significant figures can loosen it (setCutoff), then restore it.
+let _cutoff = EPSILON;
+export function setCutoff(c) { const prev = _cutoff; _cutoff = c; return prev; }
+
+// Reduce mode (§ optimization): when set to a monoid { map, combine, identity }
+// over faces, outcomes track only that scalar (e.g. the total) instead of the
+// full dice multiset. Convolution combines scalars (a 1-D fold), so a recursive
+// pool collapses to ~range-of-values outcomes instead of thousands of multisets.
+// Correct only when every read the caller will perform is a function of that one
+// reduction — the display verifies this before turning it on.
+let _RM = null;
+export const SUM = { map: f => f, combine: (a, b) => a + b, identity: 0 };
+
+function mergeDist(list) {
+  const m = new Map();
+  for (const o of list) {
+    if (o.prob < _cutoff) continue;
+    const s = _RM ? (o.barred ? 'B' : 'v' + o.v) : sigOf(o);
+    const e = m.get(s);
+    if (e) e.prob += o.prob; else m.set(s, o);
+  }
+  return [...m.values()];
+}
+// convolve two distributions (independent product)
+function convolve(A, B) {
+  const out = [];
+  if (_RM) {
+    for (const a of A) for (const b of B)
+      out.push({ v: _RM.combine(a.v, b.v), barred: a.barred && b.barred, prob: a.prob * b.prob });
+  } else {
+    for (const a of A) for (const b of B) out.push({
+      aLeaves: a.aLeaves.length ? (b.aLeaves.length ? a.aLeaves.concat(b.aLeaves) : a.aLeaves) : b.aLeaves,
+      gLeaves: a.gLeaves.length ? (b.gLeaves.length ? a.gLeaves.concat(b.gLeaves) : a.gLeaves) : b.gLeaves,
+      _a: mergeSorted(a._a, b._a),
+      _g: mergeSorted(a._g, b._g),
+      prob: a.prob * b.prob,
+    });
+  }
+  return mergeDist(out);
+}
+// reduce one resolved tree to a distribution outcome (reduced or flat)
+function mkOutcome(root, prob) {
+  if (_RM) {
+    const a = activeLeaves(root);
+    let v = _RM.identity;
+    for (const l of a) v = _RM.combine(v, _RM.map(l.face));
+    return { v, barred: a.length === 0, prob };
+  }
+  const { a, g } = flatten(root);
+  return mkFlat(a, g, prob);
+}
+// flatten one resolved tree (with factors) into the distribution
+function expand(root, prob) {
+  const factors = collectFactors(root);
+  let dist = [mkOutcome(root, prob)];
+  for (const f of factors) dist = convolve(dist, f.dist);
+  return dist;
+}
+
+function enumerate(thunk, scale) {
+  const out = [];
+  const stack = [{ trace: [], weight: 1 }];
+  while (stack.length) {
+    const { trace, weight } = stack.pop();
+    if (weight * scale < _cutoff) continue;     // bound recursion by absolute mass
+    CTX = { mode: 'enumerate', trace, pointer: 0, weight, scale };
+    let root;
+    try { root = thunk(); }
+    catch (e) {
+      if (e instanceof FreshChoice) {
+        for (const { face, prob } of e.kind.pmf)
+          stack.push({ trace: [...trace, face], weight: weight * prob });
+        continue;
+      }
+      throw e;
+    }
+    for (const o of expand(root, weight)) out.push(o);
+  }
+  return mergeDist(out);
+}
+
+// memo for recursive sub-builders (§8): key = builder identity + base shape +
+// args + scale. Scale-bounding truncates a factor's recursion to the depth its
+// caller's weight actually needs (a perf feature, not just correctness), and
+// dedupes siblings (identical scale). The memo persists across a batch (shared
+// where scale matches) and is cleared per run by resetCaches().
+const _memo = new Map();
+let _fnSeq = 0;
+const _fnIds = new WeakMap();
+const fnId = fn => _fnIds.get(fn) ?? (_fnIds.set(fn, ++_fnSeq), _fnSeq);
+export function resetCaches() { _memo.clear(); }
+function builderKey(pool, scale) {
+  const t = pool._template;
+  const baseKey = t.base instanceof PoolView ? shapeKey(t.base._node)
+    : (t.base && t.base.__pool__) ? 'P' + structKeyOf(t.base) : structKeyOf(t.base);
+  return `${_RM ? 'R' : 'M'}|f${fnId(t.fn)}|${baseKey}|${JSON.stringify(t.args)}|s${scale.toExponential(10)}`;
+}
+function structKeyOf(x) {
+  x = unwrap(x);
+  if (x instanceof Pool) {
+    const t = x._template;
+    if (t instanceof LeafTemplate) return 'L' + t.kind._sig + 'x' + t.count;
+    if (t instanceof BuilderTemplate) return 'B' + fnId(t.fn);
+    return 'T';
+  }
+  return Array.isArray(x) ? '[' + x.map(structKeyOf).join(',') + ']' : String(typeof x);
+}
+
+// independent identical dice → convolve into a multiset distribution
+// (C(n+f-1,f-1) outcomes, not f^n): merging during the product avoids
+// the per-atom enumeration blow-up for plain pools like d6(8).
+function dieDist(kind) {
+  if (_RM) return kind.pmf.map(({ face, prob }) =>
+    ({ v: _RM.combine(_RM.identity, _RM.map(face)), barred: false, prob }));
+  return kind.pmf.map(({ face, prob }) => {
+    const leaf = new Leaf(kind, face);
+    return { aLeaves: [leaf], gLeaves: EMPTY, _a: [leafKey(leaf)], _g: EMPTY, prob };
+  });
+}
+function leafTemplateDist(t) {
+  let d = [_RM ? { v: _RM.identity, barred: true, prob: 1 }
+             : { aLeaves: EMPTY, gLeaves: EMPTY, _a: EMPTY, _g: EMPTY, prob: 1 }];
+  const single = dieDist(t.kind);
+  for (let i = 0; i < t.count; i++) d = convolve(d, single);
+  return d;
+}
+
+function resolveDist(p, scale = 1) {
+  p = unwrap(p);
+  // fast path: a plain pool of independent dice (no ops/builder)
+  if (p instanceof Pool && p._template instanceof LeafTemplate) return leafTemplateDist(p._template);
+  const prev = CTX;
+  const memoable = p instanceof Pool && p._template instanceof BuilderTemplate;
+  let key;
+  if (memoable) {
+    key = builderKey(p, scale);
+    const hit = _memo.get(key);
+    if (hit) return hit;
+    _memo.set(key, []);                    // tentative — breaks self-recursion
+  }
+  let dist;
+  try { dist = enumerate(() => instantiate(p), scale); }
+  finally { CTX = prev; }
+  if (memoable) _memo.set(key, dist);
+  return dist;
+}
+
+// A resolved raw outcome from a concrete tree (sample mode / roll).
+function rawOutcome(root, prob) {
+  const active = activeLeaves(root);
+  const ghosts = ghostLeaves(root);
+  return {
+    prob,
+    barred: active.length === 0,
+    dice: active.map(describe),
+    ghosts: ghosts.map(describe),
+    view: new PoolView(root),
+  };
+}
+const describe = l => ({ name: l.name, face: l.face, kind: l.kind, id: l.id });
+
+// a lightweight view over a flat distribution outcome (active+ghost leaves)
+function flatView(o) { return new PoolView(new Group(o.aLeaves.concat(o.gLeaves))); }
+
+// Build a synthetic view with the given active faces — used by the display's
+// reduced fast path to evaluate totals-only predicates on a value.
+const _scalarKind = new DieKind([0]);
+export function makeView(faces) {
+  return new PoolView(new Group(faces.map(f => new Leaf(_scalarKind, f))));
+}
+
+// reducedProbability(pool, monoid) -> [{ value, prob, barred }] tracking only
+// the monoid fold (e.g. SUM) — far fewer outcomes for recursive pools. Valid
+// only when every downstream read is a function of that reduction.
+export function reducedProbability(pool, monoid = SUM) {
+  const prev = _RM;
+  _RM = monoid;
+  try {
+    return resolveDist(pool).map(o => ({ value: o.v, prob: o.prob, barred: o.barred }));
+  } finally { _RM = prev; }
+}
+function rawFromFlat(o) {
+  return {
+    prob: o.prob,
+    barred: o.aLeaves.length === 0,
+    dice: o.aLeaves.map(describe),
+    ghosts: o.gLeaves.map(describe),
+    view: flatView(o),
   };
 }
 
-export function stats(p) {
-  _mode = 'stats';
-  p = coercePool(p);
-  const outcomes = p._resolve();
-  const pmf = toPMF(outcomes);
-  const s = pmfStats(pmf);
-  s.outcomes = outcomes;
-  s.groups = groupContributions(outcomes);
-  const namedSum = Object.values(s.groups).reduce((a,b)=>a+b,0);
-  if (namedSum > 0.001) {
-    const baseContrib = +(s.mean - namedSum).toFixed(6);
-    if (Math.abs(baseContrib) > 0.001) {
-      s.groups = {base: baseContrib, ...s.groups};
-    }
-  }
-  s.groupStarts = {};
-  for (const {dice, prob, groups} of outcomes) {
-    if (!groups || prob < EPSILON) continue;
-    const total = dice.reduce((a,b)=>a+b,0);
-    for (const name of Object.keys(groups)) {
-      if (s.groupStarts[name] === undefined || total < s.groupStarts[name])
-        s.groupStarts[name] = total;
-    }
-  }
-  s.groupParent = {};
-  const gNames = Object.keys(s.groups);
-  for (const child of gNames) {
-    let bestParent = null;
-    for (const parent of gNames) {
-      if (parent === child) continue;
-      let parentWithoutChild = false;
-      let childWithoutParent = false;
-      for (const {prob, groups} of outcomes) {
-        if (!groups || prob < EPSILON) continue;
-        if (groups[parent] !== undefined && groups[child] === undefined) parentWithoutChild = true;
-        if (groups[child] !== undefined && groups[parent] === undefined) childWithoutParent = true;
-        if (parentWithoutChild && childWithoutParent) break;
-      }
-      if (parentWithoutChild && !childWithoutParent) {
-        if (!bestParent || (s.groupStarts[parent] ?? 0) > (s.groupStarts[bestParent] ?? 0))
-          bestParent = parent;
-      }
-    }
-    if (bestParent) s.groupParent[child] = bestParent;
-  }
-  return s;
+// Presentation-ready provenance tree (roll order + node labels preserved):
+// leaves carry name/face/discarded; groups carry their label. Unlabeled
+// groups stay in the tree so a renderer can flatten or nest as it likes.
+function serializeTree(node) {
+  if (node instanceof Factor) return null;
+  if (isLeaf(node)) return { leaf: true, name: node.name, face: node.face, discarded: !node.active };
+  return { label: node.label, children: node.children.map(serializeTree).filter(Boolean) };
 }
 
+// ================================================================
+// §11 Data functions (pure)
+// ================================================================
+
+// roll(pool) -> one raw resolved outcome (active dice, ghosts, barred).
+// Carries `tree`: the labeled provenance structure in roll order.
 export function roll(p) {
-  p = coercePool(p);
-  _mode = 'roll';
-  const outcomes = p._resolve();
-  _mode = 'stats';
-  const {dice, pools} = outcomes[0];
+  CTX = { mode: 'sample' };
+  const root = instantiate(unwrap(p));
+  CTX = null;
+  const out = rawOutcome(root, 1);
+  out.tree = serializeTree(root);
+  return out;
+}
 
-  function fmtDice(arr) {
-    return (arr||[]).map(({v, t, discarded}) => ({
-      name: t ? t.name : null, rolled: v, discarded: !!discarded
-    }));
+// outcomeProbability(pool, groupBy?) -> full weighted enumeration.
+// Sums to 1 including barred mass. groupBy is a caller-supplied,
+// defaultless collapse (typically a reduce); omit for raw outcomes.
+export function outcomeProbability(p, groupBy) {
+  const dist = resolveDist(p);
+  if (!groupBy) return dist.map(rawFromFlat);
+  const m = new Map();
+  for (const o of dist) {
+    const key = groupBy(flatView(o));
+    const prev = m.get(key);
+    if (prev) prev.prob += o.prob;
+    else m.set(key, { value: key, prob: o.prob, barred: o.aLeaves.length === 0 });
   }
+  return [...m.values()];
+}
 
-  function buildPool(q) {
-    const entry = {};
-    if (q.name) entry.name = q.name;
-    if (q.dice) entry.dice = fmtDice(q.dice);
-    if (q.pools && q.pools.length) entry.pools = q.pools.map(buildPool);
-    return entry;
+// ---- §11 filter normalisation ----
+// category := predicate | { when, label?, color? };  filter := category | category[]
+function normalizeFilter(filter) {
+  const list = Array.isArray(filter) ? filter : [filter];
+  return list.map(c => typeof c === 'function' ? { when: c } : c);
+}
+
+// classify(pool, filter) -> { p:[...], barred, uncategorized }; sums to 1.
+// Barred mass is partitioned out before predicates run (§11). Each
+// non-barred outcome lands in its first matching category.
+export function classify(p, filter) {
+  const cats = normalizeFilter(filter);
+  const masses = cats.map(() => 0);
+  let barred = 0, uncategorized = 0;
+  for (const o of resolveDist(p)) {
+    if (o.aLeaves.length === 0) { barred += o.prob; continue; }
+    const view = flatView(o);
+    const i = cats.findIndex(c => c.when(view));
+    if (i < 0) uncategorized += o.prob; else masses[i] += o.prob;
   }
+  return { p: masses, barred, uncategorized };
+}
 
-  return {
-    pools: (pools||[]).map(buildPool),
-    total: dice.reduce((a,b) => a+b, 0)
-  };
+// scalingProbability(build, {from,to,step=1}, filter) -> classify per x.
+export function scalingProbability(build, { from, to, step = 1 }, filter) {
+  const rows = [];
+  for (let x = from; x <= to; x += step)
+    rows.push({ x, ...classify(build(x), filter) });
+  return rows;
+}
+
+// cumulativeProbability(pool, filter, {attempts}) -> closed form per category.
+// Single-attempt marginal p_i (categories may overlap), then 1-(1-p_i)^k.
+export function cumulativeProbability(p, filter, { attempts }) {
+  const cats = normalizeFilter(filter);
+  const single = cats.map(() => 0);
+  for (const o of resolveDist(p)) {
+    if (o.aLeaves.length === 0) continue;
+    const view = flatView(o);
+    cats.forEach((c, i) => { if (c.when(view)) single[i] += o.prob; });
+  }
+  const rows = [];
+  for (let k = 1; k <= attempts; k++)
+    rows.push({ attempts: k, p: single.map(pi => 1 - Math.pow(1 - pi, k)) });
+  return rows;
 }

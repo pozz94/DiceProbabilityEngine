@@ -1,8 +1,14 @@
 {
-  "name": "diceprobabilityengine",
+  "name": "dicescript",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Write a dice roll once; get a sampled result or a full probability distribution from the same definition.",
+  "type": "module",
+  "main": "./src/engine.js",
+  "exports": {
+    ".": "./src/engine.js",
+    "./std": "./src/std.js"
+  },
+  "files": ["src/engine.js", "src/std.js"],
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -15,8 +21,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "type": "module",
+  "license": "MPL-2.0",
   "bugs": {
     "url": "https://github.com/pozz94/DiceProbabilityEngine/issues"
   },

@@ -1,196 +1,378 @@
+// ================================================================
+// display — website-only rendering layer (NOT published to npm).
+//
+// Thin wrappers over the engine's pure data functions. Presentation
+// (title, label, color, mode, axis) is read only here; the data
+// functions receive only pool / over / the filter `when` predicates,
+// so presentation can never influence a probability (Display spec).
+// ================================================================
+
 import {
-  Pool, coercePool, die, customDie, memoize, stats, roll, poolBuilder,
-  _pendingKeys, _resolvedCache, resetEngineState,
+  Pool, PoolView, pool, die, poolBuilder, max, min,
+  roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
+  resetCaches, reducedProbability, SUM, makeView,
 } from './engine.js';
-
-// Arrays can be used anywhere a Pool is expected.
-// Non-enumerable so for...in loops on arrays are unaffected.
-// NOTE: 'then' is intentionally omitted — it would make arrays thenable,
-//       causing them to be unwrapped by Promise resolution.
-for (const [name, fn] of [
-  ['keepHigh', function(n)       { return coercePool(this).keepHigh(n); }],
-  ['keepLow',  function(n)       { return coercePool(this).keepLow(n); }],
-  ['addDice',  function(p, q, r) { return coercePool(this).addDice(p, q, r); }],
-  ['addBonus', function(n, name) { return coercePool(this).addBonus(n, name); }],
-  ['when',     function(c, r)    { return coercePool(this).when(c, r); }],
-  ['discard',  function()        { return coercePool(this).discard(); }],
-]) {
-  Object.defineProperty(Array.prototype, name, {
-    value: fn, writable: true, configurable: true, enumerable: false,
-  });
-}
+import * as std from './std.js';
 import {
-  esc,
-  renderError, renderRollBlock, renderScalingBlock,
-  renderCumulativeBlock, renderStatBlock,
+  esc, renderError, renderRollBlock, renderStatBlock,
+  renderScalingBlock, renderCumulativeBlock,
 } from './render.js';
-
-// ================================================================
-// Display API — user-facing functions that queue render results,
-// and runCode which drives the editor → engine → render pipeline
-// ================================================================
 
 export let _displayResults = [];
 export let _logs = [];
 
-function coerceDegrees(condition) {
-  if (!condition) return null;
-  if (typeof condition === 'function') return [
-    {label: 'fail', color: '#ef4444', fn: v => !condition(v)},
-    {label: 'pass', color: '#a3e635', fn: condition},
-  ];
-  return condition;
+const DEFAULT_AXIS = std.total;                 // value-axis default lives here, not the engine
+const PALETTE = ['#60c8f0', '#a3e635', '#facc15', '#f97316', '#ef4444', '#a78bfa', '#34d399'];
+
+// ---- §1 filter normalisation (presentation side keeps label/color) ----
+// category := predicate | { when, label?, color? };  filter := category | category[]
+function categories(filter, { passFail = false } = {}) {
+  if (filter == null) return [];
+  if (passFail && typeof filter === 'function') {
+    return [
+      { when: filter, label: 'pass', color: '#a3e635' },
+      { when: v => !filter(v), label: 'fail', color: '#ef4444' },
+    ];
+  }
+  const list = Array.isArray(filter) ? filter : [filter];
+  return list.map((c, i) => {
+    const cat = typeof c === 'function' ? { when: c } : c;
+    return {
+      when: cat.when,
+      label: cat.label ?? `set ${i + 1}`,
+      color: cat.color ?? PALETTE[i % PALETTE.length],
+    };
+  });
+}
+// the data layer sees only the `when` predicates
+const predicates = cats => cats.map(c => ({ when: c.when }));
+
+// Classify pre-resolved outcomes by first matching category. A miss has no
+// active dice (total 0), so with `excludeBarred=false` a `total === 0`
+// predicate catches misses (weapon/danger charts); with `excludeBarred=true`
+// it mirrors the engine's classify (barred partitioned out) for the pass/fail
+// legend. Leftovers go to `other`. Takes raw so the pool is resolved once.
+function classifyRaw(raw, cats, excludeBarred = false) {
+  const masses = cats.map(() => 0);
+  let other = 0;
+  for (const o of raw) {
+    if (excludeBarred && o.barred) continue;
+    const i = cats.findIndex(c => c.when(o.view));
+    if (i < 0) other += o.prob; else masses[i] += o.prob;
+  }
+  return { p: masses, other };
 }
 
-export function display(poolOrStats, label, passFn, opts) {
-  try {
-    if (passFn && typeof passFn === 'object' && !passFn.fn && typeof passFn !== 'function') {
-      opts = passFn; passFn = null;
+// ---- value-axis distribution stats over pre-resolved outcomes ----
+function statsFromRaw(raw, axis) {
+  let barred = 0;
+  const pmf = new Map();           // by axis value (the bars) — a miss is value 0
+  const repByValue = new Map();    // a representative resolved view per value
+  for (const o of raw) {
+    if (o.barred) barred += o.prob;
+    // a barred miss has no active dice; it reduces to 0 → show it at x=0
+    const v = o.barred ? 0 : axis(o.view);
+    pmf.set(v, (pmf.get(v) || 0) + o.prob);
+    if (!repByValue.has(v)) repByValue.set(v, o.view);
+  }
+  const sorted = [...pmf.entries()].sort((a, b) => a[0] - b[0]);
+  let mean = 0;
+  for (const [v, pr] of sorted) mean += v * pr;
+  let variance = 0;
+  for (const [v, pr] of sorted) variance += pr * (v - mean) ** 2;
+  let cum = 0, median = sorted[0]?.[0] ?? 0, mode = sorted[0]?.[0] ?? 0, modeP = 0, gotMed = false;
+  for (const [v, pr] of sorted) if (pr > modeP) { modeP = pr; mode = v; }
+  const pct = q => {
+    let c = 0;
+    for (const [v, pr] of sorted) { c += pr; if (c >= q - 1e-9) return v; }
+    return sorted[sorted.length - 1]?.[0] ?? 0;
+  };
+  for (const [v, pr] of sorted) { cum += pr; if (!gotMed && cum >= 0.5 - 1e-9) { median = v; gotMed = true; } }
+  return {
+    sorted, repByValue, barred,
+    mean, median, mode, stddev: Math.sqrt(variance),
+    min: sorted[0]?.[0] ?? 0, max: sorted[sorted.length - 1]?.[0] ?? 0,
+    p10: pct(0.1), p25: pct(0.25), p75: pct(0.75), p90: pct(0.9),
+  };
+}
+
+// ---- "totals-only" detection → reduced (≈60×) resolution when safe ----
+// A chart can be resolved tracking just the sum iff its axis and every filter
+// are functions of the total. (1) Capability probe: reject anything that reads
+// individual dice (shows / [i] / size / bounds / sort / is / label …) — those
+// need the full multiset. (2) Invariance test: among reduce-only fns, reject
+// those whose result changes at equal totals (e.g. count of 1s).
+function onlyReduce(fns) {
+  let struct = false;
+  const probe = {};
+  const rec = () => { struct = true; return probe; };
+  probe.reduce = (r, s) => [1, 2, 3, 4, 5, 6].reduce(r, s);
+  probe.reduceDiscarded = (_r, s) => s;
+  probe.count = (p) => probe.reduce((a, c) => (p(c) ? a + 1 : a), 0);
+  for (const m of ['shows', 'highest', 'lowest', 'sort', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = rec;
+  for (const r of ['total', 'sum', 'maxed', 'floored', 'product'])
+    Object.defineProperty(probe, r, { get: () => probe.reduce((a, c) => a + c, 0), configurable: true });
+  Object.defineProperty(probe, 'size', { get: () => { struct = true; return 1; }, configurable: true });
+  Object.defineProperty(probe, 'bounds', { get: () => { struct = true; return { min: 0, max: 0, span: 0 }; }, configurable: true });
+  for (let i = 0; i < 8; i++) Object.defineProperty(probe, String(i), { get: rec, configurable: true });
+  for (const fn of fns) { try { fn(probe); } catch { struct = true; } }
+  return !struct;
+}
+function sumInvariant(fns) {
+  for (const S of [0, 1, 2, 4, 7, 13]) {
+    const views = S === 0
+      ? [makeView([]), makeView([0]), makeView([0, 0])]
+      : [makeView([S]), makeView([0, S]), ...(S >= 2 ? [makeView([1, S - 1])] : []),
+         makeView(Array(Math.min(S, 8)).fill(1).concat(S > 8 ? [S - 8] : []))];
+    for (const fn of fns) {
+      const r0 = fn(views[0]);
+      for (let i = 1; i < views.length; i++) if (fn(views[i]) !== r0) return false;
     }
-    const s = (poolOrStats instanceof Pool || Array.isArray(poolOrStats))
-      ? stats(coercePool(poolOrStats))
-      : poolOrStats;
-    _displayResults.push({label: label || null, stats: s, passFn: passFn || null, opts: opts || {}});
+  }
+  return true;
+}
+const fastEligible = (axis, cats) => {
+  const fns = [axis, ...cats.map(c => c.when)];
+  return onlyReduce(fns) && sumInvariant(fns);
+};
+// resolve one pool to raw outcomes — reduced fast path when totals-only,
+// else the full multiset enumeration. `fast` is precomputed once per chart.
+function resolveRaw(pool, fast) {
+  if (fast) return reducedProbability(pool, SUM).map(d => ({
+    prob: d.prob, barred: d.barred, view: makeView(d.barred ? [] : [d.value]),
+  }));
+  return outcomeProbability(pool);
+}
+
+// ================================================================
+// The four display functions. Each takes a single options object,
+// `over`'s shape selecting the engine data function (Display §2).
+// ================================================================
+
+export function display({ pool: p, filter, axis = DEFAULT_AXIS, title, mode } = {}) {
+  try {
+    const target = typeof p === 'function' ? p() : p;
+    const cats = categories(filter, { passFail: true });
+    const raw = resolveRaw(target, fastEligible(axis, cats));   // reduced when totals-only
+    const s = statsFromRaw(raw, axis);
+    if (cats.length) {
+      // A miss reduces to 0, so it lands in the category its predicate selects
+      // (e.g. fail under `total > 0`) — consistent with the 0-bar's fail dot and
+      // with displayScaling. So pass + fail sums to 1 (no orphaned barred mass).
+      const c = classifyRaw(raw, cats, false);
+      s.categories = cats.map((cat, i) => ({ label: cat.label, color: cat.color, mass: c.p[i] }));
+      s.uncategorized = c.other;
+      // per-value dot colour: a miss reduces to 0 (statsFromRaw buckets it
+      // there with a representative view), so its dot is the fail colour.
+      s.dotByValue = new Map();
+      for (const [v, view] of s.repByValue) {
+        const idx = cats.findIndex(cat => cat.when(view));
+        if (idx >= 0) s.dotByValue.set(v, cats[idx].color);
+      }
+    }
+    _displayResults.push({ kind: 'stat', s, title: title || null, mode });
     return s;
-  } catch(e) {
-    _logs.push(`⚠ display() error: ${e.message}`);
-    return null;
-  }
+  } catch (e) { _logs.push(`⚠ display(): ${e.message}`); }
 }
 
-export function displayRoll(poolOrResult, label) {
+export function displayRoll({ pool: p, axis = DEFAULT_AXIS, title } = {}) {
   try {
-    const isPool = Array.isArray(poolOrResult) || poolOrResult instanceof Pool;
-    const poolRef = isPool ? coercePool(poolOrResult) : null;
-    const rollResult = isPool ? roll(poolRef) : poolOrResult;
-    if (!rollResult || !rollResult.pools) {
-      _logs.push(`⚠ displayRoll() expects a Pool or roll() result`);
-      return;
-    }
-    _displayResults.push({ label: label || null, rollResult, poolRef });
-  } catch(e) {
-    _logs.push(`⚠ displayRoll() error: ${e.message}`);
-  }
+    const ref = typeof p === 'function' ? p() : p;
+    const result = roll(ref);
+    _displayResults.push({ kind: 'roll', result, axis, poolRef: ref, title: title || null });
+  } catch (e) { _logs.push(`⚠ displayRoll(): ${e.message}`); }
 }
 
-export function displayCumulative(poolOrFn, label, condition, opts) {
+export function displayScaling({ pool: build, over, filter, axis = DEFAULT_AXIS, title, mode } = {}) {
   try {
-    opts = opts || {};
-    const attempts = opts.attempts || 10;
-    const p = typeof poolOrFn === 'function' ? poolOrFn() : coercePool(poolOrFn);
-    const s = stats(p);
-    const degrees = coerceDegrees(condition);
-
-    const perAttempt = (degrees || []).map((d) => {
-      let prob = 0;
-      for (const {dice, prob: p2} of s.outcomes || []) {
-        if (d.fn(dice)) prob += p2;
-      }
-      return prob;
-    });
-
-    const points = [];
-    for (let n = 1; n <= attempts; n++) {
-      const cumDegrees = (degrees || []).map((d, di) => ({
-        ...d,
-        cumProb: 1 - Math.pow(1 - perAttempt[di], n),
+    const cats = categories(filter, { passFail: true });
+    // two shapes: a numeric sweep (pool: x => pool, over: {from,to,step}) or
+    // a discrete comparison (pool: [poolA, poolB, …] or [{label, pool}, …]).
+    let items;
+    if (Array.isArray(build)) {
+      const labels = over && over.labels;
+      items = build.map((it, i) => ({
+        x: (it && it.pool) ? (it.label ?? labels?.[i] ?? i) : (labels?.[i] ?? i),
+        pool: (it && it.pool) ? it.pool : it,
       }));
-      points.push({x: n, cumDegrees, perAttempt});
+    } else {
+      const { from, to, step = 1 } = over || {};
+      items = [];
+      for (let x = from; x <= to; x += step) items.push({ x, pool: build(x) });
     }
-
-    _displayResults.push({
-      label: label || null,
-      cumulativePoints: points,
-      degrees: degrees || [],
-      perAttempt,
-      opts,
+    const fast = fastEligible(axis, cats);           // same axis/filter for all items
+    const rows = items.map(({ x, pool }) => {
+      const raw = resolveRaw(pool, fast);            // reduced when totals-only
+      const st = statsFromRaw(raw, axis);
+      const row = { x, mean: st.mean, stddev: st.stddev };
+      if (cats.length) { const c = classifyRaw(raw, cats); row.p = c.p; row.other = c.other; }
+      return row;
     });
-  } catch(e) {
-    _logs.push(`⚠ displayCumulative() error: ${e.message}`);
-  }
+    _displayResults.push({ kind: 'scaling', rows, categories: cats, title: title || null, mode });
+  } catch (e) { _logs.push(`⚠ displayScaling(): ${e.message}`); }
 }
 
-export function displayScaling(poolFnOrArray, rangeOrLabel, labelOrCondition, condition, opts) {
+export function displayCumulative({ pool: p, over, filter, title, mode } = {}) {
   try {
-    let range, label, cond;
-    if (Array.isArray(poolFnOrArray)) {
-      if (typeof rangeOrLabel === 'string') {
-        range = null; label = rangeOrLabel; cond = labelOrCondition; opts = opts || condition; condition = undefined;
-      } else if (typeof rangeOrLabel === 'function' || Array.isArray(rangeOrLabel)) {
-        range = null; label = null; cond = rangeOrLabel; opts = opts || labelOrCondition;
-      } else {
-        range = rangeOrLabel; label = labelOrCondition; cond = condition;
-      }
-    } else {
-      range = rangeOrLabel; label = labelOrCondition; cond = condition;
-    }
+    const target = typeof p === 'function' ? p() : p;
+    const cats = categories(filter);
+    const rows = cumulativeProbability(target, predicates(cats), { attempts: (over || {}).attempts || 10 });
+    // single-attempt marginal p_i is the k=1 row (Display legend "%/attempt")
+    _displayResults.push({ kind: 'cumulative', rows, single: rows[0]?.p ?? [], categories: cats, title: title || null, mode });
+  } catch (e) { _logs.push(`⚠ displayCumulative(): ${e.message}`); }
+}
 
-    let entries;
-    if (Array.isArray(poolFnOrArray)) {
-      const labels = (range && range.labels) || poolFnOrArray.map((_, i) => i);
-      entries = poolFnOrArray.map((p, i) => ({x: labels[i], pool: coercePool(p)}));
-    } else {
-      const from = range.from ?? 0, to = range.to ?? 10, step = range.step ?? 1;
-      entries = [];
-      for (let n = from; n <= to; n += step) entries.push({x: n, pool: coercePool(poolFnOrArray(n))});
-    }
-    const points = entries.map(({x, pool}) => ({x, stats: stats(pool)}));
-    const degrees = coerceDegrees(cond);
-    _displayResults.push({label: label || null, scalingPoints: points, degrees, opts: opts || {}});
-  } catch(e) {
-    _logs.push(`⚠ displayScaling() error: ${e.message}`);
+// ================================================================
+// Editor sugar (website-only): ambient scope + prototype promotion.
+// These never change semantics — spellings over engine + stdlib.
+// ================================================================
+let _promoted = false;
+export function promote() {
+  if (_promoted) return; _promoted = true;
+  const def = (proto, name, value) =>
+    Object.defineProperty(proto, name, { value, writable: true, configurable: true, enumerable: false });
+  const get = (proto, name, getter) =>
+    Object.defineProperty(proto, name, { get: getter, configurable: true, enumerable: false });
+  // reductions: fluent on concrete views only (templates have no faces)
+  for (const r of ['total', 'sum', 'maxed', 'floored', 'product'])
+    get(PoolView.prototype, r, function () { return std[r](this); });
+  def(PoolView.prototype, 'count', function (pred) { return std.count(this, pred); });
+  // builder patterns: fluent on both templates and views
+  for (const proto of [Pool.prototype, PoolView.prototype]) {
+    def(proto, 'keepHigh', function (n) { return std.keepHigh(this, n); });
+    def(proto, 'keepLow', function (n) { return std.keepLow(this, n); });
+    def(proto, 'addBonus', function (n, label) { return std.addBonus(this, n, label); });
+    def(proto, 'advantage', function (e) { return std.advantage(this, e); });
+    def(proto, 'disadvantage', function (e) { return std.disadvantage(this, e); });
   }
 }
 
 function fmtVal(v) {
-  if (v instanceof Pool) return `[Pool n=${v._n} type=${v.type}]`;
+  if (v instanceof Pool) return `[pool size=${v.size}]`;
+  if (v instanceof PoolView) return `[pool ${std.total(v)} | ${v.size} dice]`;
   if (typeof v === 'number') return String(+v.toFixed(6)).replace(/\.?0+$/, '');
-  if (v && typeof v === 'object' && 'total' in v && 'pools' in v) {
-    function renderPool(pool, indent) {
-      const lbl = pool.name ? `${pool.name}: ` : '';
-      const diceStr = (pool.dice||[]).map(d =>
-        `${d.discarded ? '~~' : ''}[${d.name||'?'}]→${d.rolled}${d.discarded ? '~~' : ''}`
-      ).join(' ');
-      let s = `${indent}${lbl}${diceStr}`;
-      if (pool.pools && pool.pools.length)
-        s += '\n' + pool.pools.map(p => renderPool(p, indent + '\t')).join('\n');
-      return s;
-    }
-    return `total=${v.total}\n${v.pools.map(p => renderPool(p, '')).join('\n')}`;
+  if (v && v.dice && v.ghosts) {
+    const act = v.dice.map(d => `[${d.name || '?'}]→${d.face}`).join(' ');
+    const gh = v.ghosts.map(d => `~~[${d.name || '?'}]→${d.face}~~`).join(' ');
+    return `${v.barred ? '(barred) ' : ''}${act}${gh ? ' ' + gh : ''}`;
   }
-  if (v && typeof v === 'object' && 'mean' in v) return `{mean:${v.mean.toFixed(2)} med:${v.median}}`;
+  if (v && typeof v === 'object') return JSON.stringify(v);
   return String(v);
 }
 
-// getEditorValue: () => string, injected by editor.js to avoid circular deps
-export function runCode(getEditorValue) {
+// ================================================================
+// Interactive controls — declared in the sandbox, returning their
+// current value (so they feed straight into poolBuilder args). Changing
+// one re-runs the script. Values persist across control-driven re-runs
+// (keyed by label) and reset to defaults on an explicit Run.
+// ================================================================
+let _controls = [];                 // declared this run, in order
+const _controlValues = new Map();   // key -> current value (persists)
+let _rerun = () => {};
+let _rerunPending = false;
+function scheduleRerun() {
+  if (_rerunPending) return;
+  _rerunPending = true;
+  requestAnimationFrame(() => { _rerunPending = false; _rerun(); });
+}
+const ctrlValue = (key, dflt) => (_controlValues.has(key) ? _controlValues.get(key) : dflt);
+
+export function slider(label, opts = {}) {
+  const { min = 0, max = 10, step = 1, value = min } = opts;
+  const key = 's:' + label;
+  const cur = ctrlValue(key, value);
+  _controls.push({ type: 'slider', key, label, min, max, step, value: cur });
+  return cur;
+}
+export function select(label, options = [], opts = {}) {
+  const norm = options.map(o => (o && typeof o === 'object' && 'value' in o) ? o : { label: String(o), value: o });
+  const key = 'o:' + label;
+  const cur = ctrlValue(key, 'value' in opts ? opts.value : norm[0]?.value);
+  _controls.push({ type: 'select', key, label, options: norm, value: cur });
+  return cur;
+}
+export function toggle(label, value = false) {
+  const key = 't:' + label;
+  const cur = ctrlValue(key, value);
+  _controls.push({ type: 'toggle', key, label, value: cur });
+  return cur;
+}
+
+function renderControls() {
+  const bar = document.getElementById('controls-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  bar.style.display = _controls.length ? '' : 'none';
+  for (const c of _controls) {
+    const w = document.createElement('label');
+    w.className = 'control';
+    if (c.type === 'slider') {
+      w.innerHTML = `<span class="ctrl-label">${esc(c.label)}</span>`
+        + `<input type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}">`
+        + `<span class="ctrl-val">${c.value}</span>`;
+      const input = w.querySelector('input'), out = w.querySelector('.ctrl-val');
+      input.addEventListener('input', () => {
+        out.textContent = input.value;
+        _controlValues.set(c.key, Number(input.value));
+        scheduleRerun();
+      });
+    } else if (c.type === 'select') {
+      w.innerHTML = `<span class="ctrl-label">${esc(c.label)}</span><select>`
+        + c.options.map((o, i) => `<option value="${i}"${o.value === c.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')
+        + `</select>`;
+      const sel = w.querySelector('select');
+      sel.addEventListener('change', () => {
+        _controlValues.set(c.key, c.options[sel.value].value);
+        scheduleRerun();
+      });
+    } else {
+      w.innerHTML = `<input type="checkbox"${c.value ? ' checked' : ''}><span class="ctrl-label">${esc(c.label)}</span>`;
+      const cb = w.querySelector('input');
+      cb.addEventListener('change', () => { _controlValues.set(c.key, cb.checked); scheduleRerun(); });
+    }
+    bar.appendChild(w);
+  }
+}
+
+// getEditorValue: () => string, injected by editor.js to avoid circular deps.
+// fromControl=true skips clearing control values (a control nudged the re-run).
+export function runCode(getEditorValue, fromControl = false) {
+  _rerun = () => runCode(getEditorValue, true);
+  promote();
   const src = getEditorValue().trim();
-  if (!src) return;
 
   const outputEl = document.getElementById('output-scroll');
   outputEl.innerHTML = '';
+  resetCaches();        // fresh per run; pools within this run share sub-distributions
   _displayResults = [];
   _logs = [];
-  resetEngineState();
+  _controls = [];
+  if (!fromControl) _controlValues.clear();   // explicit Run resets controls to defaults
+  if (!src) { renderControls(); return; }
 
+  // runtime: engine + stdlib + display, with ambient dice/reductions in scope
   const rt = {
-    pool: coercePool, die, customDie, memoize, poolBuilder,
-    stats, roll,
+    pool, die, poolBuilder, max, min,
+    roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
     display, displayRoll, displayScaling, displayCumulative,
-    total: dice => dice.reduce((a, b) => a + b, 0),
-    ev:    dice => dice.reduce((a, b) => a + b, 0), // legacy alias
-    console: {log: (...args) => _logs.push(args.map(fmtVal).join(' '))},
+    slider, select, toggle,             // interactive controls
+    ...std,                              // d2..d100, total, sum, count, keepHigh, ...
+    console: { log: (...a) => _logs.push(a.map(fmtVal).join(' ')) },
   };
-  for (const n of [2, 3, 4, 6, 8, 10, 12, 20, 100]) rt[`d${n}`] = die(n);
 
   try {
-    // eslint-disable-next-line no-new-func
-    const fn = new Function(...Object.keys(rt), `"use strict";\n${src}`);
-    fn(...Object.values(rt));
+    // Run user code inside `with(rt)` so ambient names (d6, total, count,
+    // advantage, …) are in scope, yet a user `const advantage = slider(...)`
+    // *shadows* them instead of colliding (non-strict, hence no `with` ban).
+    const fn = new Function('__rt', `with (__rt) {\n${src}\n}`);
+    fn(rt);
   } catch (e) {
-    renderError(outputEl, e.message + (e.stack ? '\n' + e.stack.split('\n').slice(1,4).join('\n') : ''));
+    if (!fromControl) renderControls();   // don't rebuild the bar mid-drag
+    renderError(outputEl, e.message + (e.stack ? '\n' + e.stack.split('\n').slice(1, 4).join('\n') : ''));
     return;
   }
+
+  if (!fromControl) renderControls();     // bar persists across control-driven re-runs
 
   if (_displayResults.length === 0 && _logs.length === 0) {
     outputEl.innerHTML = '<div class="empty-state"><div class="big">∅</div><div>No output — use display() or console.log()</div></div>';
@@ -200,14 +382,16 @@ export function runCode(getEditorValue) {
   if (_logs.length > 0) {
     const block = document.createElement('div');
     block.className = 'result-block';
-    block.innerHTML = `<div class="result-label">CONSOLE</div><div class="log-block">${_logs.map(l => `<div class="log-line" style="${l.startsWith('⚠') ? 'color:var(--accent3)' : ''}">${esc(l)}</div>`).join('')}</div>`;
+    block.innerHTML = `<div class="result-label">CONSOLE</div><div class="log-block">${
+      _logs.map(l => `<div class="log-line" style="${l.startsWith('⚠') ? 'color:var(--accent3)' : ''}">${esc(l)}</div>`).join('')
+    }</div>`;
     outputEl.appendChild(block);
   }
 
   _displayResults.forEach((r, i) => {
-    if (r.rollResult)            renderRollBlock(outputEl, r.rollResult, r.label || `Roll ${i+1}`, r.poolRef);
-    else if (r.scalingPoints)    renderScalingBlock(outputEl, r.scalingPoints, r.label || `Scaling ${i+1}`, r.degrees, r.opts);
-    else if (r.cumulativePoints) renderCumulativeBlock(outputEl, r.cumulativePoints, r.label || `Cumulative ${i+1}`, r.degrees, r.perAttempt, r.opts);
-    else                         renderStatBlock(outputEl, r.stats, r.label || `Distribution ${i+1}`, r.passFn, r.opts);
+    if (r.kind === 'roll') renderRollBlock(outputEl, r.result, r.axis, r.title || `Roll ${i + 1}`, r.poolRef);
+    else if (r.kind === 'scaling') renderScalingBlock(outputEl, r.rows, r.categories, r.title || `Scaling ${i + 1}`, { mode: r.mode });
+    else if (r.kind === 'cumulative') renderCumulativeBlock(outputEl, r.rows, r.single, r.categories, r.title || `Cumulative ${i + 1}`, { mode: r.mode });
+    else renderStatBlock(outputEl, r.s, r.title || `Distribution ${i + 1}`, { mode: r.mode });
   });
 }
