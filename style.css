@@ -197,6 +197,10 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 /* Touch + portrait: focusing the editor (keyboard up) grows it to full screen;
    output stays below (reachable by scroll / on blur — no trap); split returns on blur. */
 @media (max-width: 900px) and (orientation: portrait) and (pointer: coarse) {
-  body.keyboard-open #editor-pane { height: calc(100vh - var(--topbar)); }
+  body.keyboard-open.editor-focused #editor-pane {
+    height: calc(100vh - var(--topbar));               /* fallback */
+    height: calc(100dvh - var(--topbar));              /* modern mobile */
+    height: calc(var(--vvh, 100dvh) - var(--topbar));  /* exact: visible height, minus keyboard */
+  }
 }
 /* Mobile LANDSCAPE keeps the default two-column split (each half the width). */

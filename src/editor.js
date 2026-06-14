@@ -155,10 +155,30 @@ window._editor.onDidChangeModelContent(() => {
   _saveTimer = setTimeout(() => saveDraft(getEditorValue()), 400);
 });
 
-// editor focused ≈ on-screen keyboard up → let CSS give it the full screen
-// (portrait touch only; the class is inert elsewhere)
-window._editor.onDidFocusEditorText(() => document.body.classList.add('keyboard-open'));
-window._editor.onDidBlurEditorText(() => document.body.classList.remove('keyboard-open'));
+// Full-screen editor requires BOTH: the editor is focused AND the keyboard is
+// open. Track each independently — editor-focused via Monaco focus/blur, and
+// keyboard-open via VisualViewport (its visible height drops well below the
+// layout height when the keyboard opens). Using the keyboard's actual state
+// (not just focus) means closing the keyboard restores the half split even if
+// the editor stays focused. --vvh holds the visible height so the full-screen
+// editor sits above the keyboard with its code scrollable.
+window._editor.onDidFocusEditorText(() => document.body.classList.add('editor-focused'));
+window._editor.onDidBlurEditorText(() => document.body.classList.remove('editor-focused'));
+
+const vv = window.visualViewport;
+if (vv) {
+  const sync = () => {
+    document.documentElement.style.setProperty('--vvh', vv.height + 'px');
+    document.body.classList.toggle('keyboard-open', (window.innerHeight - vv.height) > 150);
+  };
+  vv.addEventListener('resize', sync);
+  vv.addEventListener('scroll', sync);
+  sync();
+} else {
+  // no VisualViewport: approximate the keyboard with focus
+  window._editor.onDidFocusEditorText(() => document.body.classList.add('keyboard-open'));
+  window._editor.onDidBlurEditorText(() => document.body.classList.remove('keyboard-open'));
+}
 
 document.fonts.load('13px "DM Mono"').then(() => {
   monaco.editor.remeasureFonts();   // namespace fn, re-measures all editors
