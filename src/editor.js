@@ -9,8 +9,10 @@ self.MonacoEnvironment = {
 
 import * as monaco from 'monaco-editor';
 import { EXAMPLES, toggleExampleMenu } from './examples.js';
+import { toggleProjectsMenu } from './projects.js';
 import { runCode } from './display.js';
 import { registerHints } from './hints.js';
+import { loadDraft, saveDraft } from './storage.js';
 
 // Suppress the benign ResizeObserver loop notification
 const _OriginalResizeObserver = window.ResizeObserver;
@@ -38,6 +40,7 @@ function doRun() {
 }
 
 window._toggleExampleMenu = () => toggleExampleMenu(getEditorValue);
+window._toggleProjects = () => toggleProjectsMenu(getEditorValue);
 window._runCode = doRun;
 
 document.addEventListener('keydown', e => {
@@ -114,7 +117,7 @@ monaco.editor.defineTheme('diceTheme', {
 });
 
 window._editor = monaco.editor.create(document.getElementById('monaco-container'), {
-  value: EXAMPLES['Dice Basics']['Simple dice'],
+  value: loadDraft() ?? EXAMPLES['Dice Basics']['Simple dice'],   // restore last session
   language: 'dicescript',
   theme: 'diceTheme',
   fontSize: 13,
@@ -145,6 +148,21 @@ window._editor = monaco.editor.create(document.getElementById('monaco-container'
 
 window._editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
 
+// autosave the draft (debounced) so a reload restores the last edit
+let _saveTimer = null;
+window._editor.onDidChangeModelContent(() => {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => saveDraft(getEditorValue()), 400);
+});
+
+// editor focused ≈ on-screen keyboard up → let CSS give it the full screen
+// (portrait touch only; the class is inert elsewhere)
+window._editor.onDidFocusEditorText(() => document.body.classList.add('keyboard-open'));
+window._editor.onDidBlurEditorText(() => document.body.classList.remove('keyboard-open'));
+
 document.fonts.load('13px "DM Mono"').then(() => {
   window._editor.remeasureFonts();
 });
+
+// run once on load so the output is populated without pressing Run
+doRun();

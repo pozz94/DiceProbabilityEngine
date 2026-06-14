@@ -1,4 +1,5 @@
 import { runCode } from './display.js';
+import { toggleMenu, closeMenu } from './menu.js';
 
 // ================================================================
 // Built-in examples (new DiceScript syntax) + accordion menu logic.
@@ -39,8 +40,8 @@ display({ pool: d6(6).keepHigh(3), title: "6d6 keep 3" })`,
 
   "Attack Mechanics": {
     "Nimble attack": `// Nimble: a max explodes, a min (on the first roll) is a miss.
-// advantage/disadvantage keep the best/worst of the rolled dice; the
-// bonus is added AFTER the keep, and crit/miss read the KEPT die.
+// advantage/disadvantage keep the best/worst of the rolled dice; the bonus
+// is added AFTER the keep.
 const nimbleAttack = poolBuilder((p, { advantage = 0, vicious = 0, bonus = 0 } = {}, first = true) => {
   let atk = p.addDice(Math.abs(advantage))
   if (advantage > 0) atk = atk.keepHigh(p.size)   // keep the best -> advantage
@@ -181,6 +182,19 @@ display({ pool: explode(d10), title: "exploding d10" })`,
     "Custom dice": `display({ pool: die([1,2,3,3,4,5]), title: "skewed d6 (more 3s)" })
 display({ pool: die([0,0,0,2,4,6]), title: "swingy d6 (high variance)" })
 display({ pool: die([1,1,1,1,2,3]), title: "weak d6 (mostly 1s)" })`,
+
+    "Random die (shuffle)": `// shuffle() puts a MIXED pool in random order, so a
+// positional read becomes a random die. (On a uniform pool it's a no-op,
+// since identical dice have no meaningful order.)
+// Reroll a few times: the dice appear in a different order each run.
+displayRoll({ pool: poolBuilder(p => p.shuffle())([d4, d6, d8]), title: "mixed pool, random order" })
+
+// a uniformly-random die of the pool crits (+5 when it shows its own max)
+const randomCrit = poolBuilder(p => {
+  const r = p.shuffle()
+  return r.when(r[0].shows(max), x => x.addBonus(5, "crit"))
+})
+display({ pool: randomCrit([d4, d6, d8]), title: "random-die crit (+5 on its max)" })`,
   },
 
   "Cumulative": {
@@ -211,48 +225,27 @@ displayCumulative({
   },
 };
 
-export function populateExampleMenu(getEditorValue) {
-  const inner = document.getElementById('example-accordion-inner');
-  if (inner.children.length) return;
-  Object.entries(EXAMPLES).forEach(([colLabel, items]) => {
-    const col = document.createElement('div');
-    col.className = 'ex-col';
-    const heading = document.createElement('div');
-    heading.className = 'ex-col-title';
-    heading.textContent = colLabel.toUpperCase();
-    col.appendChild(heading);
-    Object.entries(items).forEach(([name, code]) => {
-      const btn = document.createElement('button');
-      btn.className = 'ex-btn';
-      btn.textContent = name;
-      btn.addEventListener('click', () => {
-        if (window._editor) window._editor.setValue(code);
-        closeExampleMenu();
-        runCode(getEditorValue);
-      });
-      col.appendChild(btn);
-    });
-    inner.appendChild(col);
-  });
-}
-
 export function toggleExampleMenu(getEditorValue) {
-  const acc = document.getElementById('example-accordion');
-  if (acc.classList.contains('open')) {
-    closeExampleMenu();
-  } else {
-    populateExampleMenu(getEditorValue);
-    acc.classList.add('open');
-    requestAnimationFrame(() => {
-      const h = document.getElementById('example-accordion-inner').offsetHeight;
-      document.documentElement.style.setProperty('--accordion', h + 'px');
+  toggleMenu('examples', (inner) => {
+    Object.entries(EXAMPLES).forEach(([colLabel, items]) => {
+      const col = document.createElement('div');
+      col.className = 'ex-col';
+      const heading = document.createElement('div');
+      heading.className = 'ex-col-title';
+      heading.textContent = colLabel.toUpperCase();
+      col.appendChild(heading);
+      Object.entries(items).forEach(([name, code]) => {
+        const btn = document.createElement('button');
+        btn.className = 'ex-btn';
+        btn.textContent = name;
+        btn.addEventListener('click', () => {
+          if (window._editor) window._editor.setValue(code);
+          closeMenu();
+          runCode(getEditorValue);
+        });
+        col.appendChild(btn);
+      });
+      inner.appendChild(col);
     });
-    document.getElementById('examples-btn').textContent = 'EXAMPLES ▴';
-  }
-}
-
-export function closeExampleMenu() {
-  document.getElementById('example-accordion').classList.remove('open');
-  document.documentElement.style.setProperty('--accordion', '0px');
-  document.getElementById('examples-btn').textContent = 'EXAMPLES ▾';
+  });
 }

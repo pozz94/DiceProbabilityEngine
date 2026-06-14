@@ -60,3 +60,8 @@ export const addBonus = (p, n, label = 'bonus') => p.addDice(die([n]), label);
 // roll extra and keep the best / worst — one game family's idiom.
 export const advantage = (p, extra = 1) => keepHigh(p.addDice(extra), p.size);
 export const disadvantage = (p, extra = 1) => keepLow(p.addDice(extra), p.size);
+
+// drop / keep n dice chosen uniformly at random (position- and value-blind) —
+// for "a random die is affected" mechanics. Built on the engine's sample().
+export const dropRandom = (p, n) => p.sample(n).discard();
+export const keepRandom = (p, n) => p.sample(p.size - n).discard();

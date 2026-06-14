@@ -30,6 +30,10 @@ declare class PoolView {
   lowest(n: number): PoolView;
   /** Reorder by rolled value. */
   sort(dir?: 'asc' | 'desc'): PoolView;
+  /** Sub-pool of n active dice chosen uniformly at random, in draw order (a live view). */
+  sample(n: number): PoolView;
+  /** The active dice in a uniformly random order (no-op on a uniform pool). */
+  shuffle(): PoolView;
   /** Positional sub-pool (fragile — prefer label access). */
   at(i: number): PoolView;
   /** Provenance sub-pool of dice added under this label (robust). */
@@ -103,6 +107,8 @@ declare function totalDiscarded(p: PoolView): number;
 declare function countDiscarded(p: PoolView): number;
 declare function keepHigh<T>(p: T, n: number): T;
 declare function keepLow<T>(p: T, n: number): T;
+declare function keepRandom<T>(p: T, n: number): T;
+declare function dropRandom<T>(p: T, n: number): T;
 declare function addBonus<T>(p: T, n: number, label?: string): T;
 declare function advantage<T>(p: T, extra?: number): T;
 declare function disadvantage<T>(p: T, extra?: number): T;
@@ -216,6 +222,8 @@ const COMPLETIONS = [
   { label: 'floored', kind: 'Function', insert: 'floored($1)', sig: '(dice) → number', doc: 'Lowest active face.' },
   { label: 'keepHigh', kind: 'Function', insert: 'keepHigh($1)', sig: '(p, n) → pool', doc: 'Keep the n best dice (discard the rest as ghosts).' },
   { label: 'keepLow', kind: 'Function', insert: 'keepLow($1)', sig: '(p, n) → pool', doc: 'Keep the n worst dice.' },
+  { label: 'dropRandom', kind: 'Function', insert: 'dropRandom($1)', sig: '(p, n) → pool', doc: 'Discard n dice chosen uniformly at random.' },
+  { label: 'keepRandom', kind: 'Function', insert: 'keepRandom($1)', sig: '(p, n) → pool', doc: 'Keep n dice chosen uniformly at random.' },
   { label: 'addBonus', kind: 'Function', insert: 'addBonus($1)', sig: '(p, n, label?) → pool', doc: 'Add a flat modifier as a constant die.' },
   { label: 'd2', kind: 'Variable', insert: 'd2', sig: '1d2', doc: 'Pre-built 1d2. d2(n) for n copies.' },
   { label: 'd4', kind: 'Variable', insert: 'd4', sig: '1d4', doc: 'Pre-built 1d4. d4(n) for n copies.' },

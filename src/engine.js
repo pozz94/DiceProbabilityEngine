@@ -36,6 +36,7 @@ export class DieKind {
     const m = new Map();
     for (const f of this.faces) m.set(f, (m.get(f) || 0) + 1 / this.faces.length);
     this.pmf = [...m.entries()].map(([face, prob]) => ({ face, prob }));
+    this.choices = this.pmf.map(({ face, prob }) => ({ value: face, prob }));  // for decide()
     // bounds exist only for ordered-numeric faces (§4)
     this.numeric = this.faces.every(f => typeof f === 'number');
     this.min = this.numeric ? Math.min(...this.faces) : undefined;
@@ -134,20 +135,50 @@ function labelledGroups(node, label, out = []) {
 // Enumeration context (the effect handler's runtime)
 // ----------------------------------------------------------------
 let CTX = null;
-class FreshChoice { constructor(kind) { this.kind = kind; } }
-
-// An atom asks for its face. In 'enumerate' mode we serve it from the
-// trace or throw to branch; in 'sample' mode we draw it randomly.
-function atomFace(kind) {
+// A choice point — a weighted categorical the resolver branches over. Both a
+// die's face and a random dice-selection (§ sample) go through it: in
+// 'enumerate' mode we serve the value from the trace or throw to branch over
+// every option; in 'sample' mode we draw one at random.
+class Choice { constructor(pmf) { this.pmf = pmf; } }  // pmf: [{ value, prob }]
+function decide(pmf) {
   if (CTX.mode === 'sample') {
     const r = Math.random();
     let cum = 0;
-    for (const { face, prob } of kind.pmf) { cum += prob; if (r < cum) return face; }
-    return kind.pmf[kind.pmf.length - 1].face;
+    for (const o of pmf) { cum += o.prob; if (r < cum) return o.value; }
+    return pmf[pmf.length - 1].value;
   }
   const i = CTX.pointer++;
   if (i < CTX.trace.length) return CTX.trace[i];
-  throw new FreshChoice(kind);          // first unassigned atom: branch here
+  throw new Choice(pmf);                 // first undecided choice: branch here
+}
+const atomFace = kind => decide(kind.choices);
+
+// index subsets of size k from 0..total-1 (for enumerating a random selection)
+function subsets(total, k) {
+  const out = [], idx = [];
+  (function rec(start) {
+    if (idx.length === k) { out.push(idx.slice()); return; }
+    for (let i = start; i <= total - (k - idx.length); i++) { idx.push(i); rec(i + 1); idx.pop(); }
+  })(0);
+  return out;
+}
+// k distinct indices chosen uniformly at random, in draw order (partial Fisher–Yates)
+function randomIndices(total, k) {
+  const idx = Array.from({ length: total }, (_, i) => i);
+  for (let i = 0; i < k; i++) {
+    const j = i + Math.floor(Math.random() * (total - i));
+    const t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+  }
+  return idx.slice(0, k);
+}
+// all orderings of [0 .. n-1]
+function permutations(n) {
+  const res = [], used = new Array(n).fill(false), cur = [];
+  (function rec() {
+    if (cur.length === n) { res.push(cur.slice()); return; }
+    for (let i = 0; i < n; i++) if (!used[i]) { used[i] = true; cur.push(i); rec(); cur.pop(); used[i] = false; }
+  })();
+  return res;
 }
 
 // ----------------------------------------------------------------
@@ -242,7 +273,7 @@ function structuralSize(x) {
 // Closed, versioned vocabulary; collision throws at construction.
 // ----------------------------------------------------------------
 const RESERVED = new Set([
-  'size', 'shows', 'bounds', 'highest', 'lowest', 'sort', 'reduce',
+  'size', 'shows', 'bounds', 'highest', 'lowest', 'sort', 'sample', 'shuffle', 'reduce',
   'reduceDiscarded', 'is', 'discard', 'addDice', 'when',
 ]);
 function checkLabel(label) {
@@ -266,6 +297,8 @@ export class Pool {
   }
   lowest(n) { return makePool(new OpTemplate(this._template, v => v.lowest(n))); }
   highest(n) { return makePool(new OpTemplate(this._template, v => v.highest(n))); }
+  sample(n) { return makePool(new OpTemplate(this._template, v => v.sample(n))); }
+  shuffle() { return makePool(new OpTemplate(this._template, v => v.shuffle())); }
   sort(dir) { return makePool(new OpTemplate(this._template, v => v.sort(dir))); }
   discard() { return makePool(new OpTemplate(this._template, v => v.discard())); }
 }
@@ -368,9 +401,54 @@ export class PoolView {
     return new PoolView(new Group(ls.slice(0, n)), this._root);
   }
   sort(dir = 'asc') {
-    const ls = activeLeaves(this._node).slice()
+    const active = activeLeaves(this._node).slice()
       .sort((a, b) => dir === 'desc' ? b.face - a.face : a.face - b.face);
-    return new PoolView(new Group(ls), this._root);
+    // a whole-pool reorder: the result *is* the reordered pool (new root), so
+    // returning it from a builder / a following [i] reflect the new order.
+    const root = new Group([...active, ...ghostLeaves(this._node)]);
+    return new PoolView(root, root);
+  }
+  // n active dice chosen uniformly at random (without replacement) — a fresh
+  // source of randomness, independent of position and value. Each of the
+  // C(size, n) subsets is equally likely (a live view, like highest/lowest).
+  sample(n) {
+    const ls = activeLeaves(this._node);
+    const k = Math.max(0, Math.min(n, ls.length));
+    if (k === ls.length) return new PoolView(new Group(ls.slice()), this._root);
+    // A real roll picks genuinely at random — even a uniform pool — so a
+    // displayRoll highlights a random die, not always the leftmost.
+    if (CTX && CTX.mode === 'sample') {
+      const pick = randomIndices(ls.length, k);
+      return new PoolView(new Group(pick.map(i => ls[i])), this._root);
+    }
+    // Distribution: a uniform pool is exchangeable, so the first k are
+    // distribution-equivalent to a random k — take them with no C(size,k)
+    // branching. Genuine subset enumeration only for distinguishable dice.
+    const uniform = ls.every(l => l.kind._id === ls[0].kind._id);
+    if (uniform || !CTX) return new PoolView(new Group(ls.slice(0, k)), this._root);
+    const combos = subsets(ls.length, k);
+    const chosen = decide(combos.map(idx => ({ value: idx, prob: 1 / combos.length })));
+    return new PoolView(new Group(chosen.map(i => ls[i])), this._root);
+  }
+  // the active dice in a uniformly random order (a live view). On a uniform
+  // pool order is meaningless, so it's a no-op (no permutation branching).
+  shuffle() {
+    const ls = activeLeaves(this._node);
+    if (ls.length <= 1 || ls.every(l => l.kind._id === ls[0].kind._id))
+      return new PoolView(new Group(ls.slice()), this._root);
+    let order;
+    if (CTX && CTX.mode === 'sample') {
+      order = ls.map((_, i) => i);
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const t = order[i]; order[i] = order[j]; order[j] = t;
+      }
+    } else {
+      const perms = permutations(ls.length);
+      order = decide(perms.map(p => ({ value: p, prob: 1 / perms.length })));
+    }
+    const root = new Group([...order.map(i => ls[i]), ...ghostLeaves(this._node)]);
+    return new PoolView(root, root);
   }
 
   // --- selection (§4) ---
@@ -516,7 +594,9 @@ export function setCutoff(c) { const prev = _cutoff; _cutoff = c; return prev; }
 // Correct only when every read the caller will perform is a function of that one
 // reduction — the display verifies this before turning it on.
 let _RM = null;
-export const SUM = { map: f => f, combine: (a, b) => a + b, identity: 0 };
+export const SUM = { id: 'sum', map: f => f, combine: (a, b) => a + b, identity: 0 };
+export const MAX = { id: 'max', map: f => f, combine: (a, b) => (a > b ? a : b), identity: -Infinity };
+export const MIN = { id: 'min', map: f => f, combine: (a, b) => (a < b ? a : b), identity: Infinity };
 
 function mergeDist(list) {
   const m = new Map();
@@ -574,9 +654,9 @@ function enumerate(thunk, scale) {
     let root;
     try { root = thunk(); }
     catch (e) {
-      if (e instanceof FreshChoice) {
-        for (const { face, prob } of e.kind.pmf)
-          stack.push({ trace: [...trace, face], weight: weight * prob });
+      if (e instanceof Choice) {
+        for (const { value, prob } of e.pmf)
+          stack.push({ trace: [...trace, value], weight: weight * prob });
         continue;
       }
       throw e;
@@ -600,7 +680,7 @@ function builderKey(pool, scale) {
   const t = pool._template;
   const baseKey = t.base instanceof PoolView ? shapeKey(t.base._node)
     : (t.base && t.base.__pool__) ? 'P' + structKeyOf(t.base) : structKeyOf(t.base);
-  return `${_RM ? 'R' : 'M'}|f${fnId(t.fn)}|${baseKey}|${JSON.stringify(t.args)}|s${scale.toExponential(10)}`;
+  return `${_RM ? 'R' + _RM.id : 'M'}|f${fnId(t.fn)}|${baseKey}|${JSON.stringify(t.args)}|s${scale.toExponential(10)}`;
 }
 function structKeyOf(x) {
   x = unwrap(x);

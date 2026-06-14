@@ -10,7 +10,7 @@
 import {
   Pool, PoolView, pool, die, poolBuilder, max, min,
   roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
-  resetCaches, reducedProbability, SUM, makeView,
+  resetCaches, reducedProbability, SUM, MAX, MIN, makeView,
 } from './engine.js';
 import * as std from './std.js';
 import {
@@ -96,12 +96,23 @@ function statsFromRaw(raw, axis) {
   };
 }
 
-// ---- "totals-only" detection → reduced (≈60×) resolution when safe ----
-// A chart can be resolved tracking just the sum iff its axis and every filter
-// are functions of the total. (1) Capability probe: reject anything that reads
-// individual dice (shows / [i] / size / bounds / sort / is / label …) — those
-// need the full multiset. (2) Invariance test: among reduce-only fns, reject
-// those whose result changes at equal totals (e.g. count of 1s).
+// ---- reduced-resolution detection (≈60x on recursive pools) ----
+// A chart can be resolved tracking a single monoid fold (sum / max / min)
+// iff its axis and every filter depend only on that fold. Detection is:
+// (1) Capability probe — reject anything that reads individual dice (shows /
+// [i] / size / bounds / sort / is / label …); those need the full multiset.
+// (2) Invariance — group probe views by their fold value; the fns must agree
+// within each group (e.g. `count of 1s` varies at equal totals → not sum).
+const MONOIDS = [SUM, MAX, MIN];
+const PROBE_VIEWS = [
+  [], [0],
+  [6], [3, 3], [2, 4], [1, 5], [2, 2, 2], [1, 1, 4], [0, 6],   // sum 6 (varied max/count)
+  [12], [6, 6], [4, 8], [3, 3, 3, 3], [1, 11],                  // sum 12 / max 12
+  [5], [5, 1], [5, 3], [5, 5], [5, 2, 1], [5, 0], [1, 5],       // max 5
+  [1, 9], [1, 3, 5], [1, 1], [2, 9], [2, 2, 8],                 // min 1 / min 2
+  [10], [7, 3], [3, 7], [4, 4, 4], [8, 2],                      // sum 10 / max 10
+].map(makeView);
+
 function onlyReduce(fns) {
   let struct = false;
   const probe = {};
@@ -109,7 +120,7 @@ function onlyReduce(fns) {
   probe.reduce = (r, s) => [1, 2, 3, 4, 5, 6].reduce(r, s);
   probe.reduceDiscarded = (_r, s) => s;
   probe.count = (p) => probe.reduce((a, c) => (p(c) ? a + 1 : a), 0);
-  for (const m of ['shows', 'highest', 'lowest', 'sort', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = rec;
+  for (const m of ['shows', 'highest', 'lowest', 'sort', 'sample', 'shuffle', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = rec;
   for (const r of ['total', 'sum', 'maxed', 'floored', 'product'])
     Object.defineProperty(probe, r, { get: () => probe.reduce((a, c) => a + c, 0), configurable: true });
   Object.defineProperty(probe, 'size', { get: () => { struct = true; return 1; }, configurable: true });
@@ -118,27 +129,33 @@ function onlyReduce(fns) {
   for (const fn of fns) { try { fn(probe); } catch { struct = true; } }
   return !struct;
 }
-function sumInvariant(fns) {
-  for (const S of [0, 1, 2, 4, 7, 13]) {
-    const views = S === 0
-      ? [makeView([]), makeView([0]), makeView([0, 0])]
-      : [makeView([S]), makeView([0, S]), ...(S >= 2 ? [makeView([1, S - 1])] : []),
-         makeView(Array(Math.min(S, 8)).fill(1).concat(S > 8 ? [S - 8] : []))];
+const foldView = (M, v) => v.reduce((a, c) => M.combine(a, M.map(c)), M.identity);
+function invariantUnder(M, fns) {
+  const groups = new Map();
+  for (const v of PROBE_VIEWS) {
+    const k = foldView(M, v);
+    (groups.get(k) || groups.set(k, []).get(k)).push(v);
+  }
+  for (const grp of groups.values()) {
+    if (grp.length < 2) continue;
     for (const fn of fns) {
-      const r0 = fn(views[0]);
-      for (let i = 1; i < views.length; i++) if (fn(views[i]) !== r0) return false;
+      const r0 = fn(grp[0]);
+      for (let i = 1; i < grp.length; i++) if (fn(grp[i]) !== r0) return false;
     }
   }
   return true;
 }
-const fastEligible = (axis, cats) => {
+// the monoid this chart can be reduced under, or null for the full path
+function fastReduction(axis, cats) {
   const fns = [axis, ...cats.map(c => c.when)];
-  return onlyReduce(fns) && sumInvariant(fns);
-};
-// resolve one pool to raw outcomes — reduced fast path when totals-only,
-// else the full multiset enumeration. `fast` is precomputed once per chart.
-function resolveRaw(pool, fast) {
-  if (fast) return reducedProbability(pool, SUM).map(d => ({
+  if (!onlyReduce(fns)) return null;
+  return MONOIDS.find(M => invariantUnder(M, fns)) || null;
+}
+// resolve one pool to raw outcomes — reduced fast path under monoid M (a
+// single value per outcome reconstructed as a 1-die view), else the full
+// multiset enumeration. M is precomputed once per chart.
+function resolveRaw(pool, M) {
+  if (M) return reducedProbability(pool, M).map(d => ({
     prob: d.prob, barred: d.barred, view: makeView(d.barred ? [] : [d.value]),
   }));
   return outcomeProbability(pool);
@@ -153,7 +170,7 @@ export function display({ pool: p, filter, axis = DEFAULT_AXIS, title, mode } = 
   try {
     const target = typeof p === 'function' ? p() : p;
     const cats = categories(filter, { passFail: true });
-    const raw = resolveRaw(target, fastEligible(axis, cats));   // reduced when totals-only
+    const raw = resolveRaw(target, fastReduction(axis, cats));   // reduced when fold-only
     const s = statsFromRaw(raw, axis);
     if (cats.length) {
       // A miss reduces to 0, so it lands in the category its predicate selects
@@ -200,9 +217,9 @@ export function displayScaling({ pool: build, over, filter, axis = DEFAULT_AXIS,
       items = [];
       for (let x = from; x <= to; x += step) items.push({ x, pool: build(x) });
     }
-    const fast = fastEligible(axis, cats);           // same axis/filter for all items
+    const M = fastReduction(axis, cats);             // same axis/filter for all items
     const rows = items.map(({ x, pool }) => {
-      const raw = resolveRaw(pool, fast);            // reduced when totals-only
+      const raw = resolveRaw(pool, M);               // reduced when fold-only
       const st = statsFromRaw(raw, axis);
       const row = { x, mean: st.mean, stddev: st.stddev };
       if (cats.length) { const c = classifyRaw(raw, cats); row.p = c.p; row.other = c.other; }

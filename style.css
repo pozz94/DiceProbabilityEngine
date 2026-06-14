@@ -12,32 +12,48 @@
 
 html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'DM Mono', monospace; }
 
-/* ── Example accordion ── */
-#example-accordion {
+/* ── Top-bar dropdown (examples / projects) ── */
+#menu-accordion {
   position: fixed; top: var(--topbar); left: 0; right: 0; z-index: 90;
   background: var(--bg); border-bottom: 1px solid var(--border);
   overflow: hidden; max-height: 0; transition: max-height 0.2s ease;
 }
-#example-accordion.open { max-height: 600px; }
-#example-accordion-inner {
+#menu-accordion.open { max-height: 600px; }
+#menu-inner {
   display: flex; flex-direction: row; gap: 0; padding: 0;
 }
-#example-accordion-inner .ex-col {
+#menu-inner .ex-col {
   flex: 1; padding: 0.75rem 1rem; border-right: 1px solid var(--border);
 }
-#example-accordion-inner .ex-col:last-child { border-right: none; }
-#example-accordion-inner .ex-col-title {
+#menu-inner .ex-col:last-child { border-right: none; }
+#menu-inner .ex-col-title {
   font-size: 0.52rem; letter-spacing: 0.12em; color: var(--muted);
   padding-bottom: 0.4rem; margin-bottom: 0.3rem;
   border-bottom: 1px solid var(--border);
 }
-#example-accordion-inner .ex-btn {
+#menu-inner .ex-btn {
   display: block; width: 100%; text-align: left;
-  background: none; border: none; color: var(--fg);
+  background: none; border: none; color: var(--text);
   font-size: 0.65rem; padding: 0.25rem 0.4rem; cursor: pointer;
   border-radius: 4px; font-family: inherit; white-space: nowrap;
 }
-#example-accordion-inner .ex-btn:hover { background: var(--surface2); }
+#menu-inner .ex-btn:hover { background: var(--surface2); }
+/* projects rows */
+#menu-inner .proj-save { color: var(--accent2); }
+#menu-inner .proj-empty { font-size: 0.6rem; color: var(--muted); padding: 0.3rem 0.4rem; }
+#menu-inner .proj-row { display: flex; align-items: center; gap: 0.25rem; }
+#menu-inner .proj-row .proj-load { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#menu-inner .proj-del {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 0.7rem; padding: 0.15rem 0.35rem; border-radius: 4px; line-height: 1;
+}
+#menu-inner .proj-del:hover { background: var(--surface2); color: var(--accent3); }
+#menu-inner .proj-io { display: flex; gap: 0.25rem; margin: 0.15rem 0 0.35rem; }
+#menu-inner .proj-io .ex-btn { width: auto; flex: 1; text-align: center; color: var(--muted); }
+#menu-inner .proj-warn {
+  margin-top: 0.5rem; padding-top: 0.4rem; border-top: 1px solid var(--border);
+  font-size: 0.55rem; line-height: 1.5; color: var(--accent3); max-width: 16rem;
+}
 
 /* ── Top bar ── */
 #topbar {
@@ -81,11 +97,11 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   #topbar .title { font-size: 0.92rem; padding: 0 0.7rem; }
   #topbar .tag { font-size: 0.55rem; padding: 0 0.55rem; }
   #topbar button { padding: 0 0.95rem; font-size: 0.78rem; }
-  /* examples menu: stack columns and scroll instead of overflowing sideways */
-  #example-accordion-inner { flex-direction: column; }
-  #example-accordion-inner .ex-col { border-right: none; border-bottom: 1px solid var(--border); }
-  #example-accordion-inner .ex-col:last-child { border-bottom: none; }
-  #example-accordion.open { max-height: 70vh; overflow-y: auto; }
+  /* menu: stack columns and scroll instead of overflowing sideways */
+  #menu-inner { flex-direction: column; }
+  #menu-inner .ex-col { border-right: none; border-bottom: 1px solid var(--border); }
+  #menu-inner .ex-col:last-child { border-bottom: none; }
+  #menu-accordion.open { max-height: 70vh; overflow-y: auto; }
 }
 @media (max-width: 400px) {
   #topbar .tag { display: none; }           /* drop branding when really tight */
@@ -98,7 +114,19 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   display: grid; grid-template-columns: 1fr 1fr;
   overflow: hidden; transition: top 0.2s ease;
 }
-@media (max-width: 900px) { #main { grid-template-columns: 1fr; } }
+/* Mobile/narrow PORTRAIT: editor on top, output below — each half the height. */
+@media (max-width: 900px) and (orientation: portrait) {
+  #main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  #editor-pane { border-right: none; border-bottom: 1px solid var(--border); }
+}
+/* Touch + portrait: when the editor is focused (keyboard up), it takes the
+   whole screen so you can see what you type; output returns on blur. */
+@media (max-width: 900px) and (orientation: portrait) and (pointer: coarse) {
+  body.keyboard-open #main { grid-template-rows: 1fr; }
+  body.keyboard-open #output-pane { display: none; }
+}
+/* Mobile LANDSCAPE keeps the side-by-side split (each half the width) — the
+   default two-column layout already does this. */
 
 #editor-pane { border-right: 1px solid var(--border); overflow: hidden; height: 100%; }
 #monaco-container { width: 100%; height: 100%; }
