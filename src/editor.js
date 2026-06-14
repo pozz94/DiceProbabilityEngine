@@ -13,6 +13,7 @@ import { toggleProjectsMenu } from './projects.js';
 import { runCode } from './display.js';
 import { registerHints } from './hints.js';
 import { loadDraft, saveDraft } from './storage.js';
+import { setupDiceScript } from './monaco-theme.js';
 
 // Suppress the benign ResizeObserver loop notification
 const _OriginalResizeObserver = window.ResizeObserver;
@@ -50,71 +51,10 @@ document.addEventListener('keydown', e => {
   }
 });
 
-// Register 'dicescript' as a language that uses JavaScript tokenization
-// but has NO built-in worker or intellisense. This prevents Monaco's JS
-// language service from registering its own completion provider (which hangs
-// with a no-op worker and shows "Loading..." forever).
-monaco.languages.register({ id: 'dicescript' });
-monaco.languages.setLanguageConfiguration('dicescript', {
-  comments: { lineComment: '//', blockComment: ['/*', '*/'] },
-  brackets: [['(', ')'], ['[', ']'], ['{', '}']],
-  autoClosingPairs: [
-    { open: '(', close: ')' },
-    { open: '[', close: ']' },
-    { open: '{', close: '}' },
-    { open: "'", close: "'", notIn: ['string', 'comment'] },
-    { open: '"', close: '"', notIn: ['string'] },
-    { open: '`', close: '`', notIn: ['string'] },
-  ],
-  surroundingPairs: [
-    { open: '(', close: ')' },
-    { open: '[', close: ']' },
-    { open: '{', close: '}' },
-    { open: "'", close: "'" },
-    { open: '"', close: '"' },
-    { open: '`', close: '`' },
-  ],
-  indentationRules: {
-    increaseIndentPattern: /^.*\{[^}"'`]*$/,
-    decreaseIndentPattern: /^\s*\}/,
-  },
-});
-
-// Reuse Monaco's built-in JavaScript monarch tokenizer for syntax highlighting.
-const jsLang = monaco.languages.getLanguages().find(l => l.id === 'javascript');
-if (jsLang && jsLang.loader) {
-  jsLang.loader().then(({ language }) => {
-    monaco.languages.setMonarchTokensProvider('dicescript', language);
-  });
-}
+// Register the 'dicescript' language + theme (shared with the docs page).
+setupDiceScript();
 
 registerHints();
-
-monaco.editor.defineTheme('diceTheme', {
-  base: 'vs-dark',
-  inherit: true,
-  rules: [
-    { token: 'comment',    foreground: '4a4a5a', fontStyle: 'italic' },
-    { token: 'keyword',    foreground: '60c8f0' },
-    { token: 'number',     foreground: 'f060a8' },
-    { token: 'string',     foreground: 'c8f060' },
-    { token: 'identifier', foreground: 'e8e8f0' },
-  ],
-  colors: {
-    'editor.background':                  '#0e0e10',
-    'editor.foreground':                  '#e8e8f0',
-    'editorLineNumber.foreground':        '#2a2a35',
-    'editorLineNumber.activeForeground':  '#6a6a80',
-    'editor.lineHighlightBackground':     '#16161a',
-    'editorCursor.foreground':            '#c8f060',
-    'editor.selectionBackground':         '#2a2a35',
-    'editorWidget.background':            '#1e1e24',
-    'editorSuggestWidget.background':     '#1e1e24',
-    'editorSuggestWidget.border':         '#2a2a35',
-    'scrollbarSlider.background':         '#2a2a3580',
-    'scrollbarSlider.hoverBackground':    '#2a2a35cc',
-  }
-});
 
 window._editor = monaco.editor.create(document.getElementById('monaco-container'), {
   value: loadDraft() ?? EXAMPLES['Dice Basics']['Simple dice'],   // restore last session

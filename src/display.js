@@ -351,6 +351,40 @@ function renderControls() {
   }
 }
 
+// the sandbox runtime: engine + stdlib + display, ambient dice/reductions in
+// scope. Shared by the playground (runCode) and the docs page (runSnippet).
+function makeRuntime() {
+  return {
+    pool, die, poolBuilder, max, min,
+    roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
+    display, displayRoll, displayScaling, displayCumulative,
+    slider, select, toggle,             // interactive controls
+    ...std,                             // d2..d100, total, sum, count, keepHigh, ...
+    console: { log: (...a) => _logs.push(a.map(fmtVal).join(' ')) },
+  };
+}
+
+// Run a snippet in isolation and return its display results + logs, without
+// touching the playground's global output bar. The docs page uses this to
+// render a live chart beside each code sample; controls resolve to their
+// default value (no live re-run wiring outside the playground).
+export function runSnippet(src) {
+  promote();
+  resetCaches();
+  const sR = _displayResults, sL = _logs, sC = _controls, sV = new Map(_controlValues);
+  _displayResults = []; _logs = []; _controls = []; _controlValues.clear();
+  try {
+    const fn = new Function('__rt', `with (__rt) {\n${src}\n}`);
+    fn(makeRuntime());
+    return { results: _displayResults, logs: _logs, error: null };
+  } catch (e) {
+    return { results: [], logs: _logs, error: e.message };
+  } finally {
+    _displayResults = sR; _logs = sL; _controls = sC;
+    _controlValues.clear(); for (const [k, v] of sV) _controlValues.set(k, v);
+  }
+}
+
 // getEditorValue: () => string, injected by editor.js to avoid circular deps.
 // fromControl=true skips clearing control values (a control nudged the re-run).
 export function runCode(getEditorValue, fromControl = false) {
@@ -368,14 +402,7 @@ export function runCode(getEditorValue, fromControl = false) {
   if (!src) { renderControls(); return; }
 
   // runtime: engine + stdlib + display, with ambient dice/reductions in scope
-  const rt = {
-    pool, die, poolBuilder, max, min,
-    roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
-    display, displayRoll, displayScaling, displayCumulative,
-    slider, select, toggle,             // interactive controls
-    ...std,                              // d2..d100, total, sum, count, keepHigh, ...
-    console: { log: (...a) => _logs.push(a.map(fmtVal).join(' ')) },
-  };
+  const rt = makeRuntime();
 
   try {
     // Run user code inside `with(rt)` so ambient names (d6, total, count,
