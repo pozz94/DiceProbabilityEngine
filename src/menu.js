@@ -29,6 +29,9 @@ export function closeMenu() {
 function syncButtons() {
   for (const k of Object.keys(LABELS)) {
     const btn = document.getElementById(k + '-btn');
-    if (btn) btn.textContent = LABELS[k] + (current === k ? ' ▴' : ' ▾');
+    if (!btn) continue;
+    const open = current === k;
+    btn.textContent = LABELS[k] + (open ? ' ▴' : ' ▾');
+    btn.setAttribute('aria-expanded', String(open));   // the arrow, for screen readers
   }
 }

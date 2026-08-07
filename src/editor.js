@@ -40,12 +40,23 @@ function doRun() {
   runCode(getEditorValue);
 }
 
-window._toggleExampleMenu = () => toggleExampleMenu(getEditorValue);
-window._toggleProjects = () => toggleProjectsMenu(getEditorValue);
-window._runCode = doRun;
+// Wire the top-bar buttons. They ship disabled: this module only runs once
+// Monaco (~3.7 MB) is in, so enabling them here is what tells the user the app
+// is ready — better than a click landing on a handler that doesn't exist yet.
+for (const [id, handler] of [
+  ['run-btn', doRun],
+  ['examples-btn', () => toggleExampleMenu(getEditorValue)],
+  ['projects-btn', () => toggleProjectsMenu(getEditorValue)],
+]) {
+  const btn = document.getElementById(id);
+  btn.addEventListener('click', handler);
+  btn.disabled = false;
+}
 
+// Ctrl+Enter from anywhere on the page. Monaco owns the shortcut while the
+// editor itself has focus (addCommand below), so skip it in that case.
 document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !window._editor) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !window._editor?.hasTextFocus()) {
     e.preventDefault();
     doRun();
   }
@@ -71,6 +82,7 @@ window._editor = monaco.editor.create(document.getElementById('monaco-container'
   overviewRulerBorder: false,
   folding: false,
   lineNumbers: 'on',
+  ariaLabel: 'DiceScript editor',
   glyphMargin: false,
   lineDecorationsWidth: 0,
   lineNumbersMinChars: 3,

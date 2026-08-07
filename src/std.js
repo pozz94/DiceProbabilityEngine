@@ -30,10 +30,21 @@ export const d100 = die(100, 'd100');
 // §2 Reductions over active dice (presets over `reduce`). Numeric faces;
 // symbolic systems supply their own reducer.
 // ----------------------------------------------------------------
-export const sum = p => p.reduce((acc, current = 0) => acc + current, 0);
+// The three reducers that are monoid folds are shared, tagged singletons rather
+// than fresh closures. A caller can then tell *by reference* that a function
+// only ever folds with one of them — no guessing from behaviour — which is what
+// lets the resolver track a single scalar instead of the whole dice multiset.
+// Untagged reducers (product, count, anything hand-written) simply aren't
+// recognised, so they take the exact path.
+const fold = (id, fn) => Object.assign(fn, { __fold: id });
+export const SUM_REDUCER = fold('sum', (acc, current = 0) => acc + current);
+export const MAX_REDUCER = fold('max', (acc, current) => Math.max(acc, current));
+export const MIN_REDUCER = fold('min', (acc, current) => Math.min(acc, current));
+
+export const sum = p => p.reduce(SUM_REDUCER, 0);
 export const total = sum;                    // player-facing alias
-export const maxed = p => p.reduce((acc, current) => Math.max(acc, current), -Infinity);
-export const floored = p => p.reduce((acc, current) => Math.min(acc, current), +Infinity);
+export const maxed = p => p.reduce(MAX_REDUCER, -Infinity);
+export const floored = p => p.reduce(MIN_REDUCER, +Infinity);
 export const product = p => p.reduce((acc, current) => acc * current, 1);
 export const count = (p, pred) =>
   p.reduce((acc, current) => pred(current) ? acc + 1 : acc, 0);

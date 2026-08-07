@@ -19,36 +19,41 @@
 </head>
 <body>
 
-<div id="topbar">
-  <div class="title">⚄<span class="title-text"> Dice Engine</span></div>
+<header id="topbar">
+  <h1 class="title"><span aria-hidden="true">⚄</span><span class="title-text"> Dice Engine</span></h1>
   <div class="tag">DiceScript</div>
   <div class="spacer"></div>
   <div class="shortcut">Ctrl+Enter</div>
   <a class="example" id="docs-btn" href="docs.html">DOCS</a>
-  <button class="example" id="examples-btn" onclick="window._toggleExampleMenu()">EXAMPLES ▾</button>
-  <button class="example" id="projects-btn" onclick="window._toggleProjects()">PROJECTS ▾</button>
-  <button class="run" onclick="window._runCode()">▶ RUN</button>
-</div>
+  <!-- disabled until editor.js wires them up (it loads Monaco first) -->
+  <button type="button" class="example" id="examples-btn" disabled
+          aria-expanded="false" aria-controls="menu-accordion">EXAMPLES ▾</button>
+  <button type="button" class="example" id="projects-btn" disabled
+          aria-expanded="false" aria-controls="menu-accordion">PROJECTS ▾</button>
+  <button type="button" class="run" id="run-btn" disabled>▶ RUN</button>
+</header>
 
 <div id="menu-accordion">
   <div id="menu-inner"></div>
 </div>
 
-<div id="main">
-  <div id="editor-pane">
+<main id="main">
+  <section id="editor-pane" aria-label="Editor">
     <div id="monaco-container"></div>
-  </div>
-  <div id="output-pane">
-    <div class="pane-header">OUTPUT</div>
+  </section>
+  <section id="output-pane" aria-label="Output">
+    <h2 class="pane-header">OUTPUT</h2>
+    <!-- charts carry no text of their own, so a run is announced as a summary -->
+    <p id="run-status" class="sr-only" role="status" aria-live="polite"></p>
     <div id="controls-bar" style="display:none"></div>
     <div id="output-scroll">
       <div class="empty-state">
-        <div class="big">⚄</div>
+        <div class="big" aria-hidden="true">⚄</div>
         <div>Write expressions · press Run</div>
       </div>
     </div>
-  </div>
-</div>
+  </section>
+</main>
 
 </body>
 </html>

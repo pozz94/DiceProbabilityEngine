@@ -10,7 +10,7 @@
 import {
   Pool, PoolView, pool, die, poolBuilder, max, min,
   roll, outcomeProbability, classify, scalingProbability, cumulativeProbability,
-  resetCaches, reducedProbability, SUM, MAX, MIN, makeView,
+  resetCaches, sweep, setKeepGhosts, reducedProbability, makeView, MONOID_BY_ID,
 } from './engine.js';
 import * as std from './std.js';
 import {
@@ -96,69 +96,97 @@ function statsFromRaw(raw, axis) {
   };
 }
 
-// ---- reduced-resolution detection (≈60x on recursive pools) ----
-// A chart can be resolved tracking a single monoid fold (sum / max / min)
-// iff its axis and every filter depend only on that fold. Detection is:
-// (1) Capability probe — reject anything that reads individual dice (shows /
-// [i] / size / bounds / sort / is / label …); those need the full multiset.
-// (2) Invariance — group probe views by their fold value; the fns must agree
-// within each group (e.g. `count of 1s` varies at equal totals → not sum).
-const MONOIDS = [SUM, MAX, MIN];
-const PROBE_VIEWS = [
-  [], [0],
-  [6], [3, 3], [2, 4], [1, 5], [2, 2, 2], [1, 1, 4], [0, 6],   // sum 6 (varied max/count)
-  [12], [6, 6], [4, 8], [3, 3, 3, 3], [1, 11],                  // sum 12 / max 12
-  [5], [5, 1], [5, 3], [5, 5], [5, 2, 1], [5, 0], [1, 5],       // max 5
-  [1, 9], [1, 3, 5], [1, 1], [2, 9], [2, 2, 8],                 // min 1 / min 2
-  [10], [7, 3], [3, 7], [4, 4, 4], [8, 2],                      // sum 10 / max 10
-].map(makeView);
+// ---- what does this chart need to look at? ----
+// Charts used to be resolved by guessing that the axis and filters were
+// functions of a single fold (sum/max/min) and then re-running them against a
+// synthetic one-die view holding that number. The guess was made by probing,
+// and probing cannot be made sound: it silently halved `count(v === 100)` on
+// 2d100, and silently zeroed any filter reading discarded dice. Both were found
+// by testing, not by reading, so the whole mechanism is gone.
+//
+// What survives is the one question probing *can* answer exactly: whether a
+// function ever calls a given method. A call is the entire signal — no
+// value-invariance is assumed — which makes the check below sound.
 
-function onlyReduce(fns) {
-  let struct = false;
+// Does anything this chart reads look at the *discarded* dice? When the answer
+// is no, the engine can stop distinguishing outcomes by their ghosts, which is
+// exact (nothing can tell those outcomes apart) rather than an approximation.
+function readsDiscarded(fns) {
+  let reads = false;
   const probe = {};
-  const rec = () => { struct = true; return probe; };
+  const self = () => probe;
   probe.reduce = (r, s) => [1, 2, 3, 4, 5, 6].reduce(r, s);
-  probe.reduceDiscarded = (_r, s) => s;
+  probe.reduceDiscarded = (r, s) => { reads = true; return [1, 2].reduce(r, s); };
   probe.count = (p) => probe.reduce((a, c) => (p(c) ? a + 1 : a), 0);
-  for (const m of ['shows', 'highest', 'lowest', 'sort', 'sample', 'shuffle', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = rec;
+  for (const m of ['shows', 'highest', 'lowest', 'sort', 'sample', 'shuffle', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = self;
   for (const r of ['total', 'sum', 'maxed', 'floored', 'product'])
     Object.defineProperty(probe, r, { get: () => probe.reduce((a, c) => a + c, 0), configurable: true });
-  Object.defineProperty(probe, 'size', { get: () => { struct = true; return 1; }, configurable: true });
-  Object.defineProperty(probe, 'bounds', { get: () => { struct = true; return { min: 0, max: 0, span: 0 }; }, configurable: true });
-  for (let i = 0; i < 8; i++) Object.defineProperty(probe, String(i), { get: rec, configurable: true });
-  for (const fn of fns) { try { fn(probe); } catch { struct = true; } }
-  return !struct;
+  Object.defineProperty(probe, 'size', { get: () => 1, configurable: true });
+  Object.defineProperty(probe, 'bounds', { get: () => ({ min: 0, max: 0, span: 0 }), configurable: true });
+  for (let i = 0; i < 8; i++) Object.defineProperty(probe, String(i), { get: self, configurable: true });
+  for (const fn of fns) { try { fn(probe); } catch { return true; } }   // can't tell → keep them
+  return reads;
 }
-const foldView = (M, v) => v.reduce((a, c) => M.combine(a, M.map(c)), M.identity);
-function invariantUnder(M, fns) {
-  const groups = new Map();
-  for (const v of PROBE_VIEWS) {
-    const k = foldView(M, v);
-    (groups.get(k) || groups.set(k, []).get(k)).push(v);
+
+// resolve `body` with ghost tracking off when no read needs it
+function withGhostPolicy(fns, body) {
+  const prev = setKeepGhosts(readsDiscarded(fns));
+  try { return body(); } finally { setKeepGhosts(prev); }
+}
+
+// ---- reduced resolution: which single fold, if any, is all this chart reads? ----
+// Same capability probe, but the answer is established by *identity*, never by
+// behaviour. std exports its three monoid reducers as tagged singletons, so
+// seeing `SUM_REDUCER` passed to reduce proves the caller is summing — there is
+// nothing to guess. A hand-written reducer, `count`, `product`, a per-die read,
+// two different folds mixed, or a look at the discarded dice all yield null and
+// the chart resolves exactly.
+//
+// This is deliberately narrower than the probe it replaces. That one inferred
+// "behaves like a sum on 30 sample views", which was wrong for
+// `count(v === 100)` on 2d100 and for anything reading ghosts.
+function foldOf(fns) {
+  let seen = null, ok = true;
+  const probe = {};
+  const reject = () => { ok = false; return probe; };
+  probe.reduce = (r, s) => {
+    const tag = r && r.__fold;
+    if (!tag || (seen && seen !== tag)) ok = false; else seen = tag;
+    return [1, 2, 3, 4, 5, 6].reduce(r, s);
+  };
+  probe.reduceDiscarded = reject;
+  probe.count = reject;
+  for (const m of ['shows', 'highest', 'lowest', 'sort', 'sample', 'shuffle', 'at', 'label', 'is', 'addDice', 'discard', 'when']) probe[m] = reject;
+  for (const [name, fn] of [['total', std.total], ['sum', std.sum], ['maxed', std.maxed], ['floored', std.floored]])
+    Object.defineProperty(probe, name, { get: () => fn(probe), configurable: true });
+  for (const name of ['product']) Object.defineProperty(probe, name, { get: reject, configurable: true });
+  Object.defineProperty(probe, 'size', { get: reject, configurable: true });
+  Object.defineProperty(probe, 'bounds', { get: reject, configurable: true });
+  for (let i = 0; i < 8; i++) Object.defineProperty(probe, String(i), { get: reject, configurable: true });
+
+  for (const fn of fns) { try { fn(probe); } catch { return null; } }
+  return ok && seen ? MONOID_BY_ID[seen] ?? null : null;
+}
+
+// The escape hatch: a chart may declare its own reduction when detection is too
+// narrow — `display({ …, reduce: "sum" })`. Declaring it is an assertion by the
+// author, which is sound in the way a guess is not.
+function reductionFor(declared, fns) {
+  if (declared) {
+    const m = MONOID_BY_ID[String(declared).toLowerCase()];
+    if (!m) throw new Error(`reduce must be one of sum, max, min — got ${JSON.stringify(declared)}`);
+    return m;
   }
-  for (const grp of groups.values()) {
-    if (grp.length < 2) continue;
-    for (const fn of fns) {
-      const r0 = fn(grp[0]);
-      for (let i = 1; i < grp.length; i++) if (fn(grp[i]) !== r0) return false;
-    }
-  }
-  return true;
+  return foldOf(fns);
 }
-// the monoid this chart can be reduced under, or null for the full path
-function fastReduction(axis, cats) {
-  const fns = [axis, ...cats.map(c => c.when)];
-  if (!onlyReduce(fns)) return null;
-  return MONOIDS.find(M => invariantUnder(M, fns)) || null;
-}
-// resolve one pool to raw outcomes — reduced fast path under monoid M (a
-// single value per outcome reconstructed as a 1-die view), else the full
-// multiset enumeration. M is precomputed once per chart.
+
+// resolve one pool to raw outcomes: reduced when a single fold covers every
+// read (one synthetic die carrying the folded value), else the full multiset
 function resolveRaw(pool, M) {
-  if (M) return reducedProbability(pool, M).map(d => ({
+  if (!M) return outcomeProbability(pool);
+  return reducedProbability(pool, M).map(d => ({
     prob: d.prob, barred: d.barred, view: makeView(d.barred ? [] : [d.value]),
   }));
-  return outcomeProbability(pool);
 }
 
 // ================================================================
@@ -166,11 +194,12 @@ function resolveRaw(pool, M) {
 // `over`'s shape selecting the engine data function (Display §2).
 // ================================================================
 
-export function display({ pool: p, filter, axis = DEFAULT_AXIS, title, mode } = {}) {
+export function display({ pool: p, filter, axis = DEFAULT_AXIS, title, mode, reduce } = {}) {
   try {
     const target = typeof p === 'function' ? p() : p;
     const cats = categories(filter, { passFail: true });
-    const raw = resolveRaw(target, fastReduction(axis, cats));   // reduced when fold-only
+    const fns = [axis, ...cats.map(c => c.when)];
+    const raw = withGhostPolicy(fns, () => resolveRaw(target, reductionFor(reduce, fns)));
     const s = statsFromRaw(raw, axis);
     if (cats.length) {
       // A miss reduces to 0, so it lands in the category its predicate selects
@@ -200,7 +229,7 @@ export function displayRoll({ pool: p, axis = DEFAULT_AXIS, title } = {}) {
   } catch (e) { _logs.push(`⚠ displayRoll(): ${e.message}`); }
 }
 
-export function displayScaling({ pool: build, over, filter, axis = DEFAULT_AXIS, title, mode } = {}) {
+export function displayScaling({ pool: build, over, filter, axis = DEFAULT_AXIS, title, mode, reduce } = {}) {
   try {
     const cats = categories(filter, { passFail: true });
     // two shapes: a numeric sweep (pool: x => pool, over: {from,to,step}) or
@@ -214,17 +243,17 @@ export function displayScaling({ pool: build, over, filter, axis = DEFAULT_AXIS,
       }));
     } else {
       const { from, to, step = 1 } = over || {};
-      items = [];
-      for (let x = from; x <= to; x += step) items.push({ x, pool: build(x) });
+      items = sweep(from, to, step).map(x => ({ x, pool: build(x) }));
     }
-    const M = fastReduction(axis, cats);             // same axis/filter for all items
-    const rows = items.map(({ x, pool }) => {
-      const raw = resolveRaw(pool, M);               // reduced when fold-only
+    const fns = [axis, ...cats.map(c => c.when)];
+    const M = reductionFor(reduce, fns);          // same axis/filters for every item
+    const rows = withGhostPolicy(fns, () => items.map(({ x, pool }) => {
+      const raw = resolveRaw(pool, M);
       const st = statsFromRaw(raw, axis);
       const row = { x, mean: st.mean, stddev: st.stddev };
       if (cats.length) { const c = classifyRaw(raw, cats); row.p = c.p; row.other = c.other; }
       return row;
-    });
+    }));
     _displayResults.push({ kind: 'scaling', rows, categories: cats, title: title || null, mode });
   } catch (e) { _logs.push(`⚠ displayScaling(): ${e.message}`); }
 }
@@ -233,7 +262,8 @@ export function displayCumulative({ pool: p, over, filter, title, mode } = {}) {
   try {
     const target = typeof p === 'function' ? p() : p;
     const cats = categories(filter);
-    const rows = cumulativeProbability(target, predicates(cats), { attempts: (over || {}).attempts || 10 });
+    const rows = withGhostPolicy(cats.map(c => c.when), () =>
+      cumulativeProbability(target, predicates(cats), { attempts: (over || {}).attempts || 10 }));
     // single-attempt marginal p_i is the k=1 row (Display legend "%/attempt")
     _displayResults.push({ kind: 'cumulative', rows, single: rows[0]?.p ?? [], categories: cats, title: title || null, mode });
   } catch (e) { _logs.push(`⚠ displayCumulative(): ${e.message}`); }
@@ -385,6 +415,17 @@ export function runSnippet(src) {
   }
 }
 
+// The charts are made of empty divs (bar tooltips live in data-attributes), so
+// there is nothing for a screen reader to read after a run. Summarise instead —
+// on #run-status rather than on #output-scroll itself, which would re-announce
+// on every tick of a cutoff/control slider.
+function announce(msg) {
+  const el = document.getElementById('run-status');
+  if (el) el.textContent = msg;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
 // getEditorValue: () => string, injected by editor.js to avoid circular deps.
 // fromControl=true skips clearing control values (a control nudged the re-run).
 export function runCode(getEditorValue, fromControl = false) {
@@ -399,7 +440,7 @@ export function runCode(getEditorValue, fromControl = false) {
   _logs = [];
   _controls = [];
   if (!fromControl) _controlValues.clear();   // explicit Run resets controls to defaults
-  if (!src) { renderControls(); return; }
+  if (!src) { renderControls(); announce('Editor is empty'); return; }
 
   // runtime: engine + stdlib + display, with ambient dice/reductions in scope
   const rt = makeRuntime();
@@ -413,13 +454,15 @@ export function runCode(getEditorValue, fromControl = false) {
   } catch (e) {
     if (!fromControl) renderControls();   // don't rebuild the bar mid-drag
     renderError(outputEl, e.message + (e.stack ? '\n' + e.stack.split('\n').slice(1, 4).join('\n') : ''));
+    announce('Error: ' + e.message);
     return;
   }
 
   if (!fromControl) renderControls();     // bar persists across control-driven re-runs
 
   if (_displayResults.length === 0 && _logs.length === 0) {
-    outputEl.innerHTML = '<div class="empty-state"><div class="big">∅</div><div>No output — use display() or console.log()</div></div>';
+    outputEl.innerHTML = '<div class="empty-state"><div class="big" aria-hidden="true">∅</div><div>No output — use display() or console.log()</div></div>';
+    announce('No output — use display() or console.log()');
     return;
   }
 
@@ -438,4 +481,9 @@ export function runCode(getEditorValue, fromControl = false) {
     else if (r.kind === 'cumulative') renderCumulativeBlock(outputEl, r.rows, r.single, r.categories, r.title || `Cumulative ${i + 1}`, { mode: r.mode });
     else renderStatBlock(outputEl, r.s, r.title || `Distribution ${i + 1}`, { mode: r.mode });
   });
+
+  const summary = [];
+  if (_displayResults.length) summary.push(plural(_displayResults.length, 'result'));
+  if (_logs.length) summary.push(plural(_logs.length, 'console line'));
+  announce(`Run complete — ${summary.join(', ')}`);
 }
